@@ -1,0 +1,158 @@
+name: Android APK (ARM64, debug-signed)
+
+# Manually triggered build of an installable ARM64 (arm64-v8a) APK.
+# The APK is signed automatically by Gradle with a throw-away Android *debug* keystore
+# generated on the runner. No secrets / release keystore are used or required.
+on:
+  workflow_dispatch:
+    inputs:
+      optimize_rust:
+        description: "Compile the Rust core with optimizations (opt-level 2, no debuginfo). Strongly recommended for smooth video playback; the APK is still a debug-signed build."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  NDK_VERSION: "28.2.13676358"   # NDK r28: 16 KB page-size aligned by default (Android 15/16 ready)
+  ANDROID_PLATFORM: "android-36" # Android 16
+  BUILD_TOOLS: "36.0.0"
+
+jobs:
+  apk-arm64:
+    name: Build ARM64 debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Java (Temurin 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The GitHub ubuntu runner ships the Android SDK + sdkmanager; only install the exact pieces we need.
+      - name: Setup Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}" > /dev/null
+          echo "NDK_HOME=$SDK/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS_DIR=$SDK/build-tools/${BUILD_TOOLS}" >> "$GITHUB_ENV"
+          ls "$SDK/ndk"
+
+      - name: Setup Rust (stable + aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64-debug
+
+      - name: Toolchain versions
+        run: |
+          java -version 2>&1 | head -1; node --version; pnpm --version
+          rustc --version; cargo --version; rustup target list --installed
+
+      - name: Install JS dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Android project
+        run: pnpm tauri android init --ci
+
+      - name: Optimize Rust in debug profile
+        if: ${{ inputs.optimize_rust }}
+        run: |
+          {
+            echo "CARGO_PROFILE_DEV_OPT_LEVEL=2"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            echo "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false"
+            echo "CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false"
+            echo "CARGO_PROFILE_DEV_INCREMENTAL=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Build debug APK (aarch64)
+        run: pnpm tauri android build --debug --apk --target aarch64 --ci
+
+      - name: Collect, inspect and verify APK
+        id: apk
+        run: |
+          set -euo pipefail
+          echo "Produced APKs:"; find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -exec ls -l {} \;
+          SRC="$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)"
+          [ -n "$SRC" ] || { echo "::error::No APK produced"; exit 1; }
+          NAME="HGhub_${{ steps.ver.outputs.version }}_arm64-v8a_debug.apk"
+          mkdir -p artifacts
+          cp "$SRC" "artifacts/$NAME"
+          APK="artifacts/$NAME"
+
+          echo "== Native libraries"
+          unzip -l "$APK" | grep -E 'lib/[^/]+/.*\.so' | tee /tmp/libs.txt
+          grep -q 'lib/arm64-v8a/' /tmp/libs.txt || { echo "::error::arm64-v8a library missing"; exit 1; }
+          if grep -vq 'lib/arm64-v8a/' /tmp/libs.txt; then echo "::warning::APK contains non-arm64 libs"; fi
+
+          echo "== Manifest (badging)"
+          "$BUILD_TOOLS_DIR/aapt2" dump badging "$APK" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code|application-label|launchable-activity|application-debuggable)" | tee /tmp/badging.txt
+
+          echo "== 16 KB page alignment of native libs (zipalign -P 16)"
+          "$BUILD_TOOLS_DIR/zipalign" -c -P 16 -v 4 "$APK" | tail -3 || echo "::warning::zipalign 16KB check reported issues"
+
+          echo "== Signature"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/sig.txt
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sig.txt || { echo "::error::APK v2 signature not verified"; exit 1; }
+
+          ( cd artifacts && sha256sum "$NAME" | tee "$NAME.sha256" )
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## HGhub ${{ steps.ver.outputs.version }} – ARM64 debug APK"
+            echo ""
+            echo "| | |"; echo "|---|---|"
+            echo "| File | \`$NAME\` |"
+            echo "| Size | $(du -h "$APK" | cut -f1) |"
+            echo "| SHA-256 | \`$(cut -d' ' -f1 "artifacts/$NAME.sha256")\` |"
+            echo "| Rust optimized | ${{ inputs.optimize_rust }} |"
+            echo ""
+            echo '```'; cat /tmp/badging.txt; echo; grep -E "Signer #1 certificate (DN|SHA-256)|Verified using" /tmp/sig.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
