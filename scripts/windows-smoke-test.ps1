@@ -19,6 +19,41 @@ function Add-Result([string]$Name, [bool]$Ok, [string]$Detail) {
   if (-not $Ok) { $state.Failed = $true }
 }
 
+# While building the installer, Tauri's bundler patches a bundle-type marker into the main binary
+# (__TAURI_BUNDLE_TYPE_VAR_UNK -> ..._NSS) and restores the unpatched file afterwards
+# (tauri-bundler src/bundle.rs, patch_binary). So the installed exe must equal the built exe
+# (= HGhub.exe in the portable zip) except for those 3 marker bytes.
+function Compare-TauriBinary([string]$Installed, [string]$Built) {
+  $a = [System.IO.File]::ReadAllBytes($Installed)
+  $b = [System.IO.File]::ReadAllBytes($Built)
+  if ($a.Length -ne $b.Length) { return [pscustomobject]@{ Ok = $false; Detail = "size differs ($($a.Length) vs $($b.Length) bytes)" } }
+  $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+  $token = '__TAURI_BUNDLE_TYPE_VAR_'
+  $text = $latin1.GetString($a)
+  $norm = [byte[]]$a.Clone()
+  $marks = New-Object System.Collections.Generic.List[string]
+  $i = $text.IndexOf($token, [System.StringComparison]::Ordinal)
+  while ($i -ge 0) {
+    $at = $i + $token.Length
+    if (($at + 3) -le $a.Length) {
+      $was = $latin1.GetString($b, $at, 3)
+      $now = $latin1.GetString($a, $at, 3)
+      if ($was -ne $now) { $marks.Add(('{0} -> {1} at 0x{2:X}' -f $was, $now, $at)) }
+      [Array]::Copy($b, $at, $norm, $at, 3)
+    }
+    $i = $text.IndexOf($token, $i + 1, [System.StringComparison]::Ordinal)
+  }
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $ha = [BitConverter]::ToString($sha.ComputeHash($a)).Replace('-', '').ToLowerInvariant()
+    $hb = [BitConverter]::ToString($sha.ComputeHash($b)).Replace('-', '').ToLowerInvariant()
+    $hn = [BitConverter]::ToString($sha.ComputeHash($norm)).Replace('-', '').ToLowerInvariant()
+  } finally { $sha.Dispose() }
+  if ($ha -eq $hb) { return [pscustomobject]@{ Ok = $true; Detail = 'byte-identical to HGhub.exe in the portable zip' } }
+  if ($hn -eq $hb) { return [pscustomobject]@{ Ok = $true; Detail = "identical to HGhub.exe in the portable zip except Tauri's bundle-type marker ($($marks -join '; ')); installed sha256 $ha" } }
+  return [pscustomobject]@{ Ok = $false; Detail = "differs from HGhub.exe in the portable zip beyond Tauri's bundle-type marker (marker changes: $($marks -join '; ')); installed sha256 $ha" }
+}
+
 function Get-WebView2Version {
   foreach ($k in @(
       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
@@ -65,6 +100,16 @@ try {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     $null = $p.WaitForExit(15000)
     foreach ($c in $children) { Stop-Process -Id ([int]$c.ProcessId) -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+    # Where did the portable run write its data? (README: %APPDATA% / %LOCALAPPDATA%, nothing next to the exe.)
+    $left = @(Get-ChildItem -LiteralPath $work -Force | ForEach-Object { $_.Name } | Sort-Object)
+    Add-Result 'Portable run writes nothing next to the exe' (($left -join ',') -eq 'HGhub.exe,LICENSE.txt,README.txt') "folder now contains: $($left -join ', ')"
+    $roam = Join-Path $env:APPDATA 'com.hghub.huangguo'
+    $local = Join-Path $env:LOCALAPPDATA 'com.hghub.huangguo'
+    $roamItems = @(Get-ChildItem -LiteralPath $roam -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $localItems = @(Get-ChildItem -LiteralPath $local -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    Add-Result 'App data folder is %APPDATA%\com.hghub.huangguo' (Test-Path -LiteralPath $roam -PathType Container) "$roam contains: $($roamItems -join ', ')"
+    Add-Result 'WebView2 data folder is %LOCALAPPDATA%\com.hghub.huangguo\EBWebView' (Test-Path -LiteralPath (Join-Path $local 'EBWebView') -PathType Container) "$local contains: $($localItems -join ', ')"
   } else {
     Add-Result 'Portable HGhub.exe starts' $false "process exited during startup with exit code $($p.ExitCode)"
   }
@@ -101,16 +146,15 @@ try {
     }
     if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'HGhub' }
     $exes = @(Get-ChildItem -LiteralPath $dir -Filter '*.exe' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^uninstall' })
-    $match = $null
-    foreach ($e in $exes) {
-      if ((Get-FileHash -LiteralPath $e.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $env:EXE_SHA256) { $match = $e; break }
-    }
-    if ($match) {
-      Add-Result 'Installed app exe is the x64 binary that was built' $true "$($match.FullName) has the same SHA-256 as HGhub.exe in the portable zip"
-    } elseif ($exes.Count -gt 0) {
-      Add-Result 'Installed app exe is the x64 binary that was built' $false "exe(s) in ${dir}: $(($exes | ForEach-Object { $_.Name }) -join ', '), none matches the built binary"
+    $appExe = @($exes | Where-Object { $_.Name -ieq ($env:MAIN_BINARY + '.exe') }) + @($exes) | Select-Object -First 1
+    $portableExe = Join-Path $work 'HGhub.exe'
+    if (-not $appExe) {
+      Add-Result 'Installed app exe matches the built binary' $false "no app exe found in $dir"
+    } elseif ((Get-FileHash -LiteralPath $portableExe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXE_SHA256) {
+      Add-Result 'Installed app exe matches the built binary' $false 'reference HGhub.exe from the portable zip does not match the packaged SHA-256'
     } else {
-      Add-Result 'Installed app exe is the x64 binary that was built' $false "no app exe found in $dir"
+      $cmp = Compare-TauriBinary -Installed $appExe.FullName -Built $portableExe
+      Add-Result 'Installed app exe matches the built binary' $cmp.Ok "$($appExe.FullName): $($cmp.Detail)"
     }
     $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) ($($_.Length) bytes)" })
     Write-Host "Installed files in ${dir}: $($files -join ', ')"
