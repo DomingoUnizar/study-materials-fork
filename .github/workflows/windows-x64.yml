@@ -1,0 +1,186 @@
+name: Windows x64 (NSIS setup + portable zip)
+
+# Release build of HGhub for 64-bit Windows 10/11 on a GitHub-hosted Windows runner.
+#
+# Build recipe = the `windows` job of release.yml, unchanged: pnpm 10, Node 22, Rust stable (MSVC),
+# `pnpm tauri build --bundles nsis`. `tauri build` always compiles with the Cargo *release* profile
+# declared in src-tauri/Cargo.toml (opt-level "s", fat LTO, codegen-units 1, strip, panic = abort).
+#
+# On top of that recipe this workflow:
+#   * fails unless the app binary is an x64 (AMD64, PE32+) image without redistributable DLL imports,
+#   * builds a portable zip (HGhub.exe + README.txt + LICENSE.txt) next to the NSIS installer,
+#   * records size, SHA-256 and Authenticode status of every file in the job summary,
+#   * uploads installer, zip and SHA256SUMS as plain (non-zipped) artifacts kept for 90 days,
+#   * runs an informational launch / silent-install smoke test on the runner (never fails the job).
+#
+# No secrets and no code-signing certificate are used; nothing is published as a GitHub Release.
+# Triggers: manual run, or a push to the ci/windows-x64 branch this workflow was developed on.
+# (The other workflows in this repository only react to pushes to main or to v* tags.)
+on:
+  workflow_dispatch:
+  push:
+    branches: ["ci/windows-x64"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  MAIN_BINARY: huangguo-client # [package] name in src-tauri/Cargo.toml = Tauri's main binary name
+
+jobs:
+  windows-x64:
+    name: Build Windows x64 (setup + portable)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (stable, MSVC host)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-x64-release
+          cache-on-failure: true
+
+      - name: Toolchain versions
+        shell: pwsh
+        run: |
+          Write-Host "Runner image : $env:ImageOS $env:ImageVersion ($env:RUNNER_OS / $env:RUNNER_ARCH)"
+          Write-Host "OS           : $([System.Environment]::OSVersion.VersionString), $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "PowerShell   : $($PSVersionTable.PSVersion)"
+          Write-Host "node         : $(node --version)"
+          Write-Host "pnpm         : $(pnpm --version)"
+          Write-Host "cargo        : $(cargo --version)"
+          $rustc = @(rustc -vV)
+          $rustc | ForEach-Object { Write-Host "rustc        : $_" }
+          $hostLine = @($rustc | Where-Object { $_ -like 'host: *' })
+          if ($hostLine.Count -ne 1) { throw 'Could not read the Rust host triple from rustc -vV' }
+          $hostTriple = $hostLine[0].Substring(6).Trim()
+          if ($hostTriple -ne 'x86_64-pc-windows-msvc') {
+            throw "Rust host is '$hostTriple'; this workflow builds for the host and expects x86_64-pc-windows-msvc"
+          }
+          Write-Host 'Build target : x86_64-pc-windows-msvc (host default)'
+
+      - name: Install JS dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # Same command as the `windows` job of release.yml; `tauri build` always uses the release profile.
+      - name: Build (Release profile, NSIS installer)
+        run: pnpm tauri build --bundles nsis
+
+      - name: Package and verify (architecture, DLL imports, size, SHA-256, signature)
+        id: pkg
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: ./scripts/windows-package.ps1
+
+      # upload-artifact v7 with `archive: false` stores each file as-is: the download is the
+      # .exe / .zip / .txt itself (no zip-in-zip) and keeps the SHA-256 printed above.
+      - name: Upload installer (.exe)
+        id: up_setup
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/${{ steps.pkg.outputs.setup_name }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload portable build (.zip)
+        id: up_zip
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/${{ steps.pkg.outputs.zip_name }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload SHA-256 sums (.txt)
+        id: up_sums
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/${{ steps.pkg.outputs.sums_name }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Artifact links and digest cross-check
+        shell: pwsh
+        env:
+          SETUP_NAME: ${{ steps.pkg.outputs.setup_name }}
+          SETUP_SHA256: ${{ steps.pkg.outputs.setup_sha256 }}
+          SETUP_URL: ${{ steps.up_setup.outputs.artifact-url }}
+          SETUP_DIGEST: ${{ steps.up_setup.outputs.artifact-digest }}
+          ZIP_NAME: ${{ steps.pkg.outputs.zip_name }}
+          ZIP_SHA256: ${{ steps.pkg.outputs.zip_sha256 }}
+          ZIP_URL: ${{ steps.up_zip.outputs.artifact-url }}
+          ZIP_DIGEST: ${{ steps.up_zip.outputs.artifact-digest }}
+          SUMS_NAME: ${{ steps.pkg.outputs.sums_name }}
+          SUMS_SHA256: ${{ steps.pkg.outputs.sums_sha256 }}
+          SUMS_URL: ${{ steps.up_sums.outputs.artifact-url }}
+          SUMS_DIGEST: ${{ steps.up_sums.outputs.artifact-digest }}
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $rows = @(
+            [pscustomobject]@{ Kind = 'Installer';    Name = $env:SETUP_NAME; Sha = $env:SETUP_SHA256; Url = $env:SETUP_URL; Digest = $env:SETUP_DIGEST },
+            [pscustomobject]@{ Kind = 'Portable zip'; Name = $env:ZIP_NAME;   Sha = $env:ZIP_SHA256;   Url = $env:ZIP_URL;   Digest = $env:ZIP_DIGEST },
+            [pscustomobject]@{ Kind = 'SHA-256 sums'; Name = $env:SUMS_NAME;  Sha = $env:SUMS_SHA256;  Url = $env:SUMS_URL;  Digest = $env:SUMS_DIGEST }
+          )
+          $md = New-Object System.Collections.Generic.List[string]
+          $md.Add('### Downloads (GitHub sign-in required, kept 90 days)')
+          $md.Add('')
+          $md.Add('| | File | Artifact digest reported by upload-artifact |')
+          $md.Add('|---|---|---|')
+          foreach ($r in $rows) {
+            $digest = (([string]$r.Digest).Trim().ToLowerInvariant()) -replace '^sha256:', ''
+            if ($digest -eq $r.Sha) {
+              $state = 'matches the SHA-256 computed before upload'
+            } else {
+              $state = 'DIFFERS from the SHA-256 computed before upload'
+              Write-Host "::warning title=Artifact digest mismatch::$($r.Name): computed $($r.Sha), artifact digest '$digest'"
+            }
+            Write-Host ('{0,-13} {1}' -f $r.Kind, $r.Url)
+            Write-Host ('{0,-13} digest {1} ({2})' -f '', $digest, $state)
+            $md.Add(('| {0} | [`{1}`]({2}) | `{3}` ({4}) |' -f $r.Kind, $r.Name, $r.Url, $digest, $state))
+          }
+          $md.Add('')
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, (($md -join "`n") + "`n"), $utf8)
+
+      # Informational only: starts the portable exe and installs the setup silently on this runner
+      # (a Windows Server VM, not a Windows 11 device). Never fails the job or touches the artifacts.
+      - name: Launch smoke test on the runner (informational)
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          ZIP_NAME: ${{ steps.pkg.outputs.zip_name }}
+          SETUP_NAME: ${{ steps.pkg.outputs.setup_name }}
+          EXE_SHA256: ${{ steps.pkg.outputs.exe_sha256 }}
+        run: ./scripts/windows-smoke-test.ps1
