@@ -42,6 +42,30 @@ try {
   assert.equal(await page.locator(".spinner").count(), 0);
   report.passed.push("Home: 404 ends loading, readable error, explicit retry, empty result");
 
+  // While a video plays, Feed writes watch progress to the store every 5s. Those unrelated store
+  // writes must not re-request (and log) a video detail that already failed or is still loading.
+  await page.goto(`${origin}tests/api-loading.html?page=home`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await complete("api_feed", "", "item");
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_video"));
+  const settle = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const feedStats = () => page.evaluate(() => ({
+    video: window.apiLoadingFixture.feedCalls.filter(r => r.cmd === "api_video").length,
+    debug: window.apiLoadingFixture.debug.filter(line => line.includes("api_video")).length,
+  }));
+  await settle();
+  const before = await feedStats();
+  const writes = 6;
+  for (let i = 1; i <= writes; i++) {
+    await page.evaluate(t => window.apiLoadingFixture.saveProgress(t), i * 5);
+    await settle();
+  }
+  const after = await feedStats();
+  report.metrics = { progress_writes: writes, api_video_before: before.video, api_video_after: after.video, api_video_debug_lines_added: after.debug - before.debug };
+  assert.equal(after.video - before.video, 0, `Progress writes re-requested video details ${after.video - before.video} times`);
+  assert.equal(after.debug - before.debug, 0, "Progress writes must not append repeated detail failures to debug.log");
+  report.passed.push("Home: watch-progress writes do not re-request or re-log failed video details");
+
   await page.goto(`${origin}tests/api-loading.html`);
   await page.waitForFunction(() => window.apiLoadingFixture.ready);
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));

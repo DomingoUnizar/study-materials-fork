@@ -2,16 +2,18 @@ import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import Home from "../src/pages/Home";
 import Category from "../src/pages/Category";
-import { AppProvider } from "../src/store";
+import { AppProvider, useStore } from "../src/store";
 import "../src/index.css";
 
 type Request = { cmd: string; args: Record<string, unknown>; resolve: (value: unknown) => void; reject: (error: string) => void };
 const pending: Request[] = [];
 const fixture = {
   history: [] as { cmd: string; args: Record<string, unknown> }[],
+  feedCalls: [] as { cmd: string; args: Record<string, unknown> }[],
   debug: [] as string[],
   ready: false,
   setActive: (_active: boolean) => {},
+  saveProgress: (_t: number) => {},
   complete(cmd: string, key: string, result: "404" | "503" | "empty" | "item") {
     const index = pending.findIndex(r => r.cmd === cmd && (!key || r.args.cate === key));
     if (index < 0) throw new Error(`No pending request: ${cmd}/${key}`);
@@ -37,11 +39,23 @@ Object.assign(window, {
   __TAURI_INTERNALS__: { invoke(cmd: string, args: Record<string, unknown> = {}) {
     if (cmd === "app_boot") return Promise.resolve({ user: null, logged_in: false, base: "https://fixture.invalid" });
     if (cmd === "debug_log") { fixture.debug.push(String(args.msg)); return Promise.resolve(); }
+    // Feed detail/play requests fail like an unavailable upstream; record them to count re-requests.
+    if (cmd === "api_video" || cmd === "api_play") {
+      fixture.feedCalls.push({ cmd, args });
+      return Promise.reject("HTTP 503 Gateway: <html><h1>nginx error</h1></html>");
+    }
     if (!["api_feed", "api_category", "api_posts"].includes(cmd)) return Promise.reject(`Unexpected IPC: ${cmd}`);
     fixture.history.push({ cmd, args });
     return new Promise((resolve, reject) => pending.push({ cmd, args, resolve, reject }));
   } },
 });
+
+// The player stores watch progress every 5s; drive the same store write without media.
+function StoreProbe() {
+  const { addHistory } = useStore();
+  fixture.saveProgress = (t: number) => addHistory(424242, 1, t, 100);
+  return null;
+}
 
 function Fixture() {
   const [active, setActive] = useState(false);
@@ -49,6 +63,7 @@ function Fixture() {
   fixture.ready = true;
   const home = new URLSearchParams(location.search).get("page") === "home";
   return <AppProvider>
+    <StoreProbe />
     <div style={{ position: "relative", width: 900, height: 1000 }}>
       {home ? <Home active bottomInset={0} /> : <Category wide active={active} />}
     </div>

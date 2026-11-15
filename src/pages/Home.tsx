@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Feed from "../components/Feed";
 import { api } from "../api";
 import type { VideoCard } from "../types";
@@ -41,7 +41,8 @@ export default function Home({ active, bottomInset }: { active: boolean; bottomI
 
   useEffect(() => { if (!items.length) load(1); /* eslint-disable-next-line */ }, []);
 
-  const ids = items.map((v) => v.id);
+  // Feed 的详情预取依赖 videoIds；保持引用稳定，播放进度等无关的 store 更新就不会重复请求。
+  const ids = useMemo(() => items.map((v) => v.id), [items]);
 
   return (
     <div className="absolute inset-0 bg-black">
