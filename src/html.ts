@@ -135,16 +135,19 @@ export function sanitizeHtml(html: string): string {
   // 不支持清洗器的旧 WebView 必须拒绝正文，不能回退为原样渲染。
   if (!html || !DOMPurify.isSupported) return "";
   if (!strictSecurity) {
+    // <area href> 可在主窗口内导航，且绕过只拦截 <a> 的 handleArticleClick；兼容模式也不保留图像映射。
     const pre = DOMPurify.sanitize(html, {
       USE_PROFILES: { html: true },
       ADD_ATTR: ["data-src", "data-original", "data-lazy-src"],
       ALLOWED_URI_REGEXP: SAFE_FINAL_URI,
+      FORBID_TAGS: ["area", "map"],
     });
     const rewritten = proxyImages(pre, false);
     return DOMPurify.sanitize(rewritten, {
       USE_PROFILES: { html: true },
       ADD_ATTR: ["target", "rel", "loading"],
       ALLOWED_URI_REGEXP: SAFE_FINAL_URI,
+      FORBID_TAGS: ["area", "map"],
     });
   }
   const clean = DOMPurify.sanitize(html, {

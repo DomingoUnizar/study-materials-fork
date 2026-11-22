@@ -141,7 +141,17 @@ for (const [i, attack] of attacks.entries()) {
   });
 }
 
+await test("relaxed mode drops image-map links that bypass the click guard", () => {
+  setStrictSecurity(false);
+  try {
+    const out = sanitizeHtml('<map name="m"><area shape="rect" coords="0,0,9,9" href="hg://localhost/seg?u=https%3A%2F%2Fevil.example%2Fx"></map><img usemap="#m" src="https://img.example/a.jpg">');
+    fixture.innerHTML = out;
+    assert(!fixture.querySelector("area,map"), `image map survived: ${out}`);
+    assert(fixture.querySelector("img"), "regular image kept");
+  } finally { setStrictSecurity(true); }
+});
+
 fixture.replaceChildren();
-const report = { passed: results.filter(r => r.passed).length, failed: results.filter(r => !r.passed).length, results };
+const report ={ passed: results.filter(r => r.passed).length, failed: results.filter(r => !r.passed).length, results };
 document.querySelector("#results")!.textContent = JSON.stringify(report, null, 2);
 (window as unknown as { securityResults: typeof report }).securityResults = report;

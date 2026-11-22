@@ -10,38 +10,8 @@ mod playback_log;
 mod session;
 
 use api::Api;
+use network_policy::allowed_frontend_origin;
 use tauri::Manager;
-
-fn allowed_dev_host(host: &str) -> bool {
-    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
-        return true;
-    }
-    if let Some(configured) = option_env!("TAURI_DEV_HOST") {
-        if host.eq_ignore_ascii_case(configured.trim()) {
-            return true;
-        }
-    }
-    std::env::var("TAURI_DEV_HOST")
-        .ok()
-        .is_some_and(|v| host.eq_ignore_ascii_case(v.trim()))
-}
-
-fn allowed_frontend_origin(origin: &str) -> bool {
-    if matches!(
-        origin,
-        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost" | "null"
-    ) {
-        return true;
-    }
-    // 移动端开发可能使用 TAURI_DEV_HOST；严格模式下仅放行本机或显式配置的 TAURI_DEV_HOST。
-    cfg!(debug_assertions)
-        && url::Url::parse(origin).is_ok_and(|u| {
-            u.scheme() == "http"
-                && u.port() == Some(1420)
-                && (!network_policy::strict_security()
-                    || u.host_str().is_some_and(allowed_dev_host))
-        })
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -68,12 +38,7 @@ pub fn run() {
         })
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("navigation-guard")
-                .on_navigation(|_webview, url| {
-                    (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-                        || allowed_frontend_origin(&url.origin().ascii_serialization())
-                        || (!network_policy::strict_security()
-                            && matches!(url.scheme(), "http" | "https"))
-                })
+                .on_navigation(|_webview, url| network_policy::allowed_navigation(url))
                 .build(),
         )
         .register_asynchronous_uri_scheme_protocol("hg", |_app, request, responder| {

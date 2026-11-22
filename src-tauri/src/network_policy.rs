@@ -88,6 +88,63 @@ fn is_internal_webview_host(name: &str) -> bool {
     )
 }
 
+fn allowed_dev_host(host: &str) -> bool {
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return true;
+    }
+    if let Some(configured) = option_env!("TAURI_DEV_HOST") {
+        if host.eq_ignore_ascii_case(configured.trim()) {
+            return true;
+        }
+    }
+    std::env::var("TAURI_DEV_HOST")
+        .ok()
+        .is_some_and(|v| host.eq_ignore_ascii_case(v.trim()))
+}
+
+/// 自定义协议的 CORS 门禁：只认应用自身页面的来源；WKWebView 的自定义协议请求带 `Origin: null`。
+pub fn allowed_frontend_origin(origin: &str) -> bool {
+    allowed_frontend_origin_with_mode(origin, strict_security())
+}
+
+fn allowed_frontend_origin_with_mode(origin: &str, strict: bool) -> bool {
+    if matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost" | "null"
+    ) {
+        return true;
+    }
+    // 移动端开发可能使用 TAURI_DEV_HOST；严格模式下仅放行本机或显式配置的 TAURI_DEV_HOST。
+    cfg!(debug_assertions)
+        && Url::parse(origin).is_ok_and(|u| {
+            u.scheme() == "http"
+                && u.port() == Some(1420)
+                && (!strict || u.host_str().is_some_and(allowed_dev_host))
+        })
+}
+
+/// 主窗口导航只允许应用自身页面（及 about:blank）；应用内部的媒体/IPC 协议任何模式下都不能作为
+/// 页面打开。不复用 allowed_frontend_origin：它为 WKWebView 放行 "null"，而 hg:、data:、file:
+/// 等非特殊 scheme 的 origin 也都序列化为 "null"。宽松模式仍按文档放行 http(s) 页面。
+pub fn allowed_navigation(url: &Url) -> bool {
+    allowed_navigation_with_mode(url, strict_security())
+}
+
+fn allowed_navigation_with_mode(url: &Url, strict: bool) -> bool {
+    let host = url.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase());
+    if url.scheme() == "hg" || matches!(host.as_deref(), Some("hg.localhost" | "ipc.localhost")) {
+        return false;
+    }
+    match url.scheme() {
+        "tauri" => host.as_deref() == Some("localhost"),
+        "about" => true,
+        "http" | "https" => {
+            !strict || allowed_frontend_origin_with_mode(&url.origin().ascii_serialization(), strict)
+        }
+        _ => false,
+    }
+}
+
 pub fn allowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -366,6 +423,40 @@ mod tests {
             redirect_target(&current, "/next").unwrap().as_str(),
             "https://example.com/next"
         );
+    }
+
+    #[test]
+    fn main_window_navigation_never_opens_internal_protocols() {
+        let nav = |raw: &str, strict: bool| allowed_navigation_with_mode(&Url::parse(raw).unwrap(), strict);
+        for strict in [true, false] {
+            for raw in [
+                "tauri://localhost/",
+                "http://tauri.localhost/index.html",
+                "https://tauri.localhost/",
+                "about:blank",
+            ] {
+                assert!(nav(raw, strict), "{raw} strict={strict}");
+            }
+            for raw in [
+                "hg://localhost/seg?u=https%3A%2F%2Fevil.example%2Fpage.html",
+                "http://hg.localhost/seg?u=x",
+                "https://hg.localhost/img?u=x",
+                "http://ipc.localhost/plugin",
+                "data:text/html,<script>alert(1)</script>",
+                "file:///C:/Windows/win.ini",
+                "blob:http://tauri.localhost/1",
+                "ms-settings:privacy",
+            ] {
+                assert!(!nav(raw, strict), "{raw} strict={strict}");
+            }
+        }
+        assert!(!nav("https://example.com/", true));
+        assert!(nav("https://example.com/", false), "relaxed mode keeps its documented http(s) navigation");
+        if cfg!(debug_assertions) {
+            assert!(nav("http://localhost:1420/", true), "dev server stays reachable in debug builds");
+        }
+        assert!(allowed_frontend_origin_with_mode("null", true), "WKWebView CORS still accepts Origin: null");
+        assert!(!allowed_frontend_origin_with_mode("https://evil.example", true));
     }
 
     #[test]
