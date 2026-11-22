@@ -26,29 +26,84 @@ pub const LOCAL_ORIGIN: &str = "hg://localhost";
 const IMG_KEY: &[u8] = b"f5d965df75336270";
 const IMG_IV: &[u8] = b"97b60394abc2fbe1";
 
-static IMG_CACHE: Lazy<Mutex<HashMap<String, Arc<Vec<u8>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static PL_CACHE: Lazy<Mutex<HashMap<String, Arc<String>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static KEY_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static SEG_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static IMG_CACHE: Lazy<Mutex<MemCache<Arc<Vec<u8>>>>> = Lazy::new(|| {
+    Mutex::new(MemCache::new(IMG_CACHE_MAX, IMG_CACHE_MAX_BYTES, IMG_ENTRY_MAX_BYTES))
+});
+static PL_CACHE: Lazy<Mutex<MemCache<Arc<String>>>> = Lazy::new(|| {
+    Mutex::new(MemCache::new(PL_CACHE_MAX, PL_CACHE_MAX_BYTES, PL_ENTRY_MAX_BYTES))
+});
+static KEY_CACHE: Lazy<Mutex<MemCache<(String, Arc<Vec<u8>>)>>> = Lazy::new(|| {
+    Mutex::new(MemCache::new(KEY_CACHE_MAX, KEY_CACHE_MAX * KEY_ENTRY_MAX_BYTES, KEY_ENTRY_MAX_BYTES))
+});
+static SEG_CACHE: Lazy<Mutex<MemCache<(String, Arc<Vec<u8>>)>>> = Lazy::new(|| {
+    Mutex::new(MemCache::new(SEG_CACHE_MAX, SEG_CACHE_MAX * SEG_CACHE_MAX_BYTES, SEG_CACHE_MAX_BYTES))
+});
 
 const IMG_CACHE_MAX: usize = 240;
+/// 封面原先只限条目数；常见封面为百 KB 级，240 张远低于 64 MiB，异常大的响应不再让内存无界增长。
+const IMG_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const IMG_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const PL_CACHE_MAX: usize = 60;
+const PL_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const PL_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const KEY_CACHE_MAX: usize = 120;
+const KEY_ENTRY_MAX_BYTES: usize = 64 * 1024;
 const SEG_CACHE_MAX: usize = 36;
 const SEG_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-fn cache_put<V: Clone>(map: &Mutex<HashMap<String, V>>, key: String, val: V, max: usize) {
-    let mut m = map.lock().unwrap();
-    if m.len() >= max {
-        if let Some(k) = m.keys().next().cloned() {
-            m.remove(&k);
-        }
+/// 进程内存缓存：同时限制条目数、总字节与单条大小，满了先淘汰最久未用的条目。
+struct MemCache<V> {
+    entries: HashMap<String, (u64, usize, V)>,
+    clock: u64,
+    bytes: usize,
+    max_len: usize,
+    max_bytes: usize,
+    max_entry: usize,
+}
+
+impl<V: Clone> MemCache<V> {
+    fn new(max_len: usize, max_bytes: usize, max_entry: usize) -> Self {
+        Self { entries: HashMap::new(), clock: 0, bytes: 0, max_len, max_bytes, max_entry }
     }
-    m.insert(key, val);
+
+    fn get(&mut self, key: &str) -> Option<V> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.entries.get_mut(key).map(|(used, _, value)| {
+            *used = clock;
+            value.clone()
+        })
+    }
+
+    fn put(&mut self, key: String, value: V, size: usize) {
+        if size > self.max_entry {
+            return;
+        }
+        if let Some((_, old, _)) = self.entries.remove(&key) {
+            self.bytes -= old;
+        }
+        while self.entries.len() >= self.max_len || self.bytes + size > self.max_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (used, _, _))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some((_, old, _)) = self.entries.remove(&oldest) {
+                self.bytes -= old;
+            }
+        }
+        self.clock += 1;
+        self.bytes += size;
+        self.entries.insert(key, (self.clock, size, value));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 
 /* ───────────────────────── AES ───────────────────────── */
@@ -105,7 +160,7 @@ fn image_kind(buf: &[u8]) -> Option<&'static str> {
 
 /// 取封面：命中缓存直接返回，否则下载并按需解密。
 pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
-    if let Some(hit) = IMG_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some(hit) = IMG_CACHE.lock().unwrap().get(url) {
         let kind = image_kind(&hit).unwrap_or("image/jpeg");
         return Ok((kind.to_string(), hit));
     }
@@ -118,7 +173,7 @@ pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
     };
     let kind = image_kind(&plain).unwrap_or("image/jpeg").to_string();
     let arc = Arc::new(plain);
-    cache_put(&IMG_CACHE, url.to_string(), arc.clone(), IMG_CACHE_MAX);
+    IMG_CACHE.lock().unwrap().put(url.to_string(), arc.clone(), arc.len());
     Ok((kind, arc))
 }
 
@@ -194,7 +249,7 @@ fn rewrite_uri_attr(line: &str, prefix: &str) -> String {
 /// 取 m3u8 并把 key / 子列表 / 分片地址改写到本地协议。
 pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, String> {
     let cache_key = format!("{prefix}|{url}");
-    if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
+    if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key) {
         return Ok(hit);
     }
     let (_, bytes) = fetch_bytes(url).await?;
@@ -203,7 +258,7 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
         return Err("响应不是 HLS 播放列表".into());
     }
     let arc = Arc::new(rewrite_playlist(url, text, prefix));
-    cache_put(&PL_CACHE, cache_key, arc.clone(), PL_CACHE_MAX);
+    PL_CACHE.lock().unwrap().put(cache_key, arc.clone(), arc.len());
     Ok(arc)
 }
 
@@ -261,10 +316,10 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
 
 /// 加载分片或 AES Key（带内存缓存，避免拖动进度条时重复拉取同一 Key 或分片导致卡顿）。
 pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), String> {
-    if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url) {
         return Ok((Some(ctype), hit));
     }
-    if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url) {
         return Ok((Some(ctype), hit));
     }
     let (ctype, bytes) = fetch_bytes(url).await?;
@@ -280,10 +335,10 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     });
     let len = bytes.len();
     let arc = Arc::new(bytes);
-    if len <= 65536 {
-        cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
+    if len <= KEY_ENTRY_MAX_BYTES {
+        KEY_CACHE.lock().unwrap().put(url.to_string(), (mime.clone(), arc.clone()), len);
     } else if len <= SEG_CACHE_MAX_BYTES {
-        cache_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
+        SEG_CACHE.lock().unwrap().put(url.to_string(), (mime.clone(), arc.clone()), len);
     }
     Ok((Some(mime), arc))
 }
@@ -407,6 +462,51 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_cache_bounds_bytes_and_evicts_least_recently_used() {
+        let mut cache = MemCache::new(3, 10, 6);
+        cache.put("a".into(), 1, 4);
+        cache.put("b".into(), 2, 4);
+        assert_eq!(cache.get("a"), Some(1)); // a 刚被使用
+        cache.put("c".into(), 3, 4); // 12 > 10 字节：淘汰最久未用的 b
+        assert_eq!(cache.get("b"), None);
+        assert_eq!((cache.get("a"), cache.get("c")), (Some(1), Some(3)));
+        cache.put("huge".into(), 9, 7); // 超过单条上限：不缓存，也不挤掉其他条目
+        assert_eq!(cache.get("huge"), None);
+        assert_eq!(cache.entries.len(), 2);
+        cache.put("d".into(), 4, 1);
+        cache.put("e".into(), 5, 1); // 条目数上限 3
+        assert!(cache.entries.len() <= 3 && cache.bytes <= 10);
+        cache.clear();
+        assert_eq!((cache.entries.len(), cache.bytes), (0, 0));
+    }
+
+    #[test]
+    fn cover_cache_memory_is_bounded_without_shrinking_typical_use() {
+        let mib = 1024 * 1024;
+        // 异常大的封面：旧实现只限 240 条，300 张 1 MiB 会常驻 240 MiB。
+        let mut cache = MemCache::new(IMG_CACHE_MAX, IMG_CACHE_MAX_BYTES, IMG_ENTRY_MAX_BYTES);
+        let large = Arc::new(vec![0u8; mib]);
+        for i in 0..300 {
+            cache.put(format!("https://img.example/{i}.jpg"), large.clone(), large.len());
+        }
+        println!(
+            "1 MiB covers x300: {} entries, {} MiB resident (previously 240 entries, 240 MiB)",
+            cache.entries.len(),
+            cache.bytes / mib
+        );
+        assert!(cache.bytes <= IMG_CACHE_MAX_BYTES);
+        assert!(cache.get("https://img.example/299.jpg").is_some());
+        assert!(cache.get("https://img.example/0.jpg").is_none());
+        // 常见的百 KB 级封面仍保留满 240 条，与原行为一致。
+        let mut cache = MemCache::new(IMG_CACHE_MAX, IMG_CACHE_MAX_BYTES, IMG_ENTRY_MAX_BYTES);
+        let typical = Arc::new(vec![0u8; 150 * 1024]);
+        for i in 0..300 {
+            cache.put(format!("https://img.example/{i}.jpg"), typical.clone(), typical.len());
+        }
+        assert_eq!(cache.entries.len(), IMG_CACHE_MAX);
+    }
 
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
