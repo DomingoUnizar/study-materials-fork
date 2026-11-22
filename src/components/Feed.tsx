@@ -336,27 +336,31 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* 拉详情（当前 + 邻接预取） */
+  /* 拉详情（当前 + 邻接预取）：在途的 id 不重复请求；响应按 id 合并，滑动切换时也不丢弃；失败的 id 下次切换时重试 */
+  const requestedDetails = useRef(new Set<number>());
   useEffect(() => {
-    let alive = true;
     const need = [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean);
     need.forEach((id) => {
-      if (details[id]) return;
-      api.video(id).then((d) => { if (alive) setDetails((m) => ({ ...m, [id]: d })); }).catch(() => {});
+      if (details[id] || requestedDetails.current.has(id)) return;
+      requestedDetails.current.add(id);
+      api.video(id)
+        .then((d) => setDetails((m) => ({ ...m, [id]: d })))
+        .catch(() => { requestedDetails.current.delete(id); });
     });
-    return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index, videoIds]);
 
-  /* 吃瓜帖子：直接拿帖子详情（含 video_url） */
+  /* 吃瓜帖子：直接拿帖子详情（含 video_url），去重规则同上 */
+  const requestedPosts = useRef(new Set<number>());
   useEffect(() => {
     if (kind !== "post") return;
-    let alive = true;
     [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean).forEach((id) => {
-      if (posts[id]) return;
-      api.post(id).then((p) => { if (alive) setPosts((m) => ({ ...m, [id]: p })); }).catch(() => {});
+      if (posts[id] || requestedPosts.current.has(id)) return;
+      requestedPosts.current.add(id);
+      api.post(id)
+        .then((p) => setPosts((m) => ({ ...m, [id]: p })))
+        .catch(() => { requestedPosts.current.delete(id); });
     });
-    return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, index, videoIds]);
 
