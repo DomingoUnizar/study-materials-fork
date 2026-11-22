@@ -113,7 +113,11 @@ export default function Player({
           return;
         }
         if (!activity.isActive()) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoverCountRef.current < 4) {
+        // 清单失败时 startLoad 不会重新请求清单（只有 loadSource 会），静默重试只会一直转圈；直接显示错误。
+        const manifestFailed = data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR
+          || data.details === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT
+          || data.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !manifestFailed && recoverCountRef.current < 4) {
           recoverCountRef.current += 1;
           try { hls.startLoad(video.currentTime || -1); } catch { /* ignore */ }
           return;
