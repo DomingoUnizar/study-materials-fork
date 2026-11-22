@@ -14,7 +14,6 @@ export type VideoHandle = {
   rate: (r: number) => void;
   mute: (m: boolean) => void;
   volume: (v: number) => void;
-  reload: () => void;
 };
 
 type Props = {
@@ -132,24 +131,6 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     rate: (r: number) => { const v = videoRef.current; if (v) v.playbackRate = r; },
     mute: (m: boolean) => { const v = videoRef.current; if (v) v.muted = m; },
     volume: (vol: number) => { const v = videoRef.current; if (v) v.volume = vol; },
-    reload: () => {
-      const v = videoRef.current;
-      if (!v) return;
-      recoverCountRef.current = 0;
-      const cur = v.currentTime || 0;
-      if (hlsRef.current) {
-        try {
-          hlsRef.current.startLoad(cur);
-          activity.play("reload");
-          return;
-        } catch { /* ignore */ }
-      }
-      v.load();
-      if (cur > 0) {
-        try { v.currentTime = cur; } catch { /* ignore */ }
-      }
-      activity.play("reload");
-    },
   }));
 
   useEffect(() => {
@@ -241,7 +222,12 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
 
         // 致命错误：优先自动重连/恢复解码器，最多静默恢复 4 次，避免拖动进度条直接弹报错层
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          if (recoverCountRef.current < 4) {
+          // 清单失败时 hls.js 已按 manifestLoadingMaxRetry 重试过，而 startLoad 不会重新请求清单
+          // （只有 loadSource 会），静默恢复只会一直转圈；直接报错，交给「重新加载」换取新地址。
+          const manifestFailed = data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR
+            || data.details === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT
+            || data.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR;
+          if (!manifestFailed && recoverCountRef.current < 4) {
             recoverCountRef.current += 1;
             const delay = 250 * recoverCountRef.current;
             if (recoverTimerRef.current) window.clearTimeout(recoverTimerRef.current);

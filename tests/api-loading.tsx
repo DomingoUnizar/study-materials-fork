@@ -6,6 +6,7 @@ import { AppProvider, useStore } from "../src/store";
 import "../src/index.css";
 
 type Request = { cmd: string; args: Record<string, unknown>; resolve: (value: unknown) => void; reject: (error: string) => void };
+const signedPlayUrls = new URLSearchParams(location.search).get("play") === "signed";
 const pending: Request[] = [];
 const fixture = {
   history: [] as { cmd: string; args: Record<string, unknown> }[],
@@ -42,6 +43,11 @@ Object.assign(window, {
     // Feed detail/play requests fail like an unavailable upstream; record them to count re-requests.
     if (cmd === "api_video" || cmd === "api_play") {
       fixture.feedCalls.push({ cmd, args });
+      if (cmd === "api_play" && signedPlayUrls) {
+        // Every play request returns a freshly signed address, as the upstream does.
+        const n = fixture.feedCalls.filter(r => r.cmd === "api_play").length;
+        return Promise.resolve({ video_url: `https://cdn.fixture.invalid/ep1.m3u8?auth_key=${n}` });
+      }
       return Promise.reject("HTTP 503 Gateway: <html><h1>nginx error</h1></html>");
     }
     if (!["api_feed", "api_category", "api_posts"].includes(cmd)) return Promise.reject(`Unexpected IPC: ${cmd}`);

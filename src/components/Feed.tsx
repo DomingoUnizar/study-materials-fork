@@ -377,6 +377,16 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curId, curEp, playTry]);
 
+  /* 播放地址带时效签名（auth_key），停留或暂停过久会过期：手动「重新加载」时换取新地址，并从当前位置续播 */
+  const reloadWithFreshUrl = () => {
+    const t = videoRef.current?.el()?.currentTime || time;
+    if (t > 1) resumeRef.current = { key: playKey, t };
+    setErr("");
+    setWaiting(true);
+    setPlayUrls((m) => { const next = { ...m }; delete next[playKey]; return next; });
+    setPlayTry((n) => n + 1);
+  };
+
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
@@ -870,7 +880,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                         <span>视频暂时无法加载</span>
                         <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{err}</span>
                         <button className="px-4 py-1.5 rounded-full hg-chip-strong hg-link text-[12.5px] font-semibold pressable"
-                          onClick={() => { setErr(""); setWaiting(true); videoRef.current?.reload(); }}>
+                          onClick={reloadWithFreshUrl}>
                           重新加载
                         </button>
                       </div>

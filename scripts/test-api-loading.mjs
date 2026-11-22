@@ -18,10 +18,16 @@ try {
   browser = await chromium.launch({ headless: true, executablePath: process.env.BROWSER_EXECUTABLE || undefined });
   page = await browser.newPage({ viewport: { width: 1100, height: 1200 } });
   const errors = [];
+  const mediaRequests = [];
   page.on("pageerror", error => errors.push(error.message));
   await page.route("**/*", route => {
     const url = route.request().url();
     if (new URL(url).origin === new URL(origin).origin) return route.continue();
+    // Local media protocol: answer the way the Rust proxy does when the upstream rejects an expired signature.
+    if (new URL(url).hostname === "hg.localhost") {
+      mediaRequests.push(url);
+      return route.fulfill({ status: 502, contentType: "text/plain", headers: { "Access-Control-Allow-Origin": "*" }, body: "HTTP 403 Forbidden" });
+    }
     report.external.push(url); return route.abort();
   });
   const complete = (cmd, key, result) => page.evaluate(args => window.apiLoadingFixture.complete(...args), [cmd, key, result]);
@@ -65,6 +71,25 @@ try {
   assert.equal(after.video - before.video, 0, `Progress writes re-requested video details ${after.video - before.video} times`);
   assert.equal(after.debug - before.debug, 0, "Progress writes must not append repeated detail failures to debug.log");
   report.passed.push("Home: watch-progress writes do not re-request or re-log failed video details");
+
+  // Play addresses carry time-limited auth_key signatures. A stale address must end in the error
+  // overlay (not an endless spinner), and "重新加载" must fetch a fresh address instead of retrying it.
+  await page.goto(`${origin}tests/api-loading.html?page=home&play=signed`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await complete("api_feed", "", "item");
+  const signature = url => /auth_key%3D(\d+)/.exec(url)?.[1];
+  const started = Date.now();
+  await page.getByText("视频暂时无法加载", { exact: true }).waitFor({ state: "visible", timeout: 45000 });
+  const overlayMs = Date.now() - started;
+  const stale = signature(mediaRequests.at(-1) || "");
+  assert(stale, "Player requested the signed playlist");
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  const deadline = Date.now() + 15000;
+  while (!mediaRequests.some(url => Number(signature(url)) > Number(stale)) && Date.now() < deadline) await new Promise(r => setTimeout(r, 100));
+  const fresh = mediaRequests.map(signature).filter(s => Number(s) > Number(stale));
+  report.metrics.expired_signature = { overlay_ms: overlayMs, stale_auth_key: stale, fresh_auth_key: fresh[0] ?? null, playlist_requests: mediaRequests.length };
+  assert(fresh.length > 0, "Reload must request a newly signed play address");
+  report.passed.push("Feed: stale signed address shows the error overlay; reload fetches a fresh address");
 
   await page.goto(`${origin}tests/api-loading.html`);
   await page.waitForFunction(() => window.apiLoadingFixture.ready);
