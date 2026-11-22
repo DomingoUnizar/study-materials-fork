@@ -23,10 +23,11 @@ try {
   await page.route("**/*", route => {
     const url = route.request().url();
     if (new URL(url).origin === new URL(origin).origin) return route.continue();
-    // Local media protocol: answer the way the Rust proxy does when the upstream rejects an expired signature.
+    // Local media protocol: answer the way the Rust proxy does when the upstream rejects an expired signature
+    // (media::upstream_status keeps 403 so hls.js does not retry it).
     if (new URL(url).hostname === "hg.localhost") {
       mediaRequests.push(url);
-      return route.fulfill({ status: 502, contentType: "text/plain", headers: { "Access-Control-Allow-Origin": "*" }, body: "HTTP 403 Forbidden" });
+      return route.fulfill({ status: 403, contentType: "text/plain", headers: { "Access-Control-Allow-Origin": "*" }, body: "HTTP 403 Forbidden" });
     }
     report.external.push(url); return route.abort();
   });

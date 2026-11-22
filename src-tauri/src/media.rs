@@ -106,6 +106,33 @@ impl<V: Clone> MemCache<V> {
     }
 }
 
+type Fetched = Result<(Option<String>, Arc<Vec<u8>>), String>;
+static INFLIGHT: Lazy<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Fetched>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 同一地址的并发请求共用一次下载：WebView 中止请求（拖动、hls.js 超时/重试、startLoad）时，
+/// 已派生的下载任务不会被取消，随后重发的相同请求直接等它完成，不再向上游重复下载。
+async fn fetch_shared(url: &str) -> Fetched {
+    fetch_shared_with(url, || fetch_bytes(url)).await
+}
+
+async fn fetch_shared_with<F, Fut>(url: &str, fetch: F) -> Fetched
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(Option<String>, Vec<u8>), String>>,
+{
+    let cell = INFLIGHT.lock().unwrap().entry(url.to_string()).or_default().clone();
+    let result = cell
+        .get_or_init(|| async move { fetch().await.map(|(ctype, bytes)| (ctype, Arc::new(bytes))) })
+        .await
+        .clone();
+    let mut inflight = INFLIGHT.lock().unwrap();
+    if inflight.get(url).is_some_and(|current| Arc::ptr_eq(current, &cell)) {
+        inflight.remove(url);
+    }
+    result
+}
+
 /* ───────────────────────── AES ───────────────────────── */
 
 fn aes_cbc_decrypt(data: &[u8]) -> Option<Vec<u8>> {
@@ -164,17 +191,16 @@ pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
         let kind = image_kind(&hit).unwrap_or("image/jpeg");
         return Ok((kind.to_string(), hit));
     }
-    let (_, bytes) = fetch_bytes(url).await?;
+    let (_, bytes) = fetch_shared(url).await?;
     let plain = if image_kind(&bytes).is_some() {
         bytes
     } else {
         let dec = aes_cbc_decrypt(&bytes).ok_or_else(|| "封面解密失败".to_string())?;
-        strip_padding(dec)
+        Arc::new(strip_padding(dec))
     };
     let kind = image_kind(&plain).unwrap_or("image/jpeg").to_string();
-    let arc = Arc::new(plain);
-    IMG_CACHE.lock().unwrap().put(url.to_string(), arc.clone(), arc.len());
-    Ok((kind, arc))
+    IMG_CACHE.lock().unwrap().put(url.to_string(), plain.clone(), plain.len());
+    Ok((kind, plain))
 }
 
 /* ───────────────────────── HLS ───────────────────────── */
@@ -252,7 +278,7 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
     if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key) {
         return Ok(hit);
     }
-    let (_, bytes) = fetch_bytes(url).await?;
+    let (_, bytes) = fetch_shared(url).await?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "播放列表不是 UTF-8 文本")?;
     if !text.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
         return Err("响应不是 HLS 播放列表".into());
@@ -322,7 +348,7 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url) {
         return Ok((Some(ctype), hit));
     }
-    let (ctype, bytes) = fetch_bytes(url).await?;
+    let (ctype, bytes) = fetch_shared(url).await?;
     let mime = ctype.clone().unwrap_or_else(|| {
         let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
         if p.ends_with(".ts") {
@@ -334,7 +360,7 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
         }
     });
     let len = bytes.len();
-    let arc = Arc::new(bytes);
+    let arc = bytes;
     if len <= KEY_ENTRY_MAX_BYTES {
         KEY_CACHE.lock().unwrap().put(url.to_string(), (mime.clone(), arc.clone()), len);
     } else if len <= SEG_CACHE_MAX_BYTES {
@@ -365,6 +391,19 @@ fn respond(status: u16, ctype: &str, body: Vec<u8>, cache: &str) -> Response<Vec
         .header("Cache-Control", cache)
         .body(body)
         .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+/// 上游明确拒绝（签名过期、资源不存在）时保留原状态码，hls.js 不会重试 4xx；
+/// 超时、429、5xx 和网络错误仍按 502 返回，交给播放器重试。
+fn upstream_status(error: &str) -> u16 {
+    match error
+        .strip_prefix("HTTP ")
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        Some(code @ (401 | 403 | 404 | 410)) => code,
+        _ => 502,
+    }
 }
 
 /// 主清单的子清单也经 /seg 返回：必须继续改写，不能把内层 URL 原样交给播放器。
@@ -433,7 +472,7 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
             Ok((kind, bytes)) => {
                 respond(200, &kind, bytes.as_ref().clone(), "public, max-age=86400")
             }
-            Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+            Err(e) => respond(upstream_status(&e), "text/plain", e.into_bytes(), "no-store"),
         },
         "/hls" => match load_playlist(&target, origin).await {
             Ok(text) => respond(
@@ -442,13 +481,13 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
                 text.as_bytes().to_vec(),
                 "no-store",
             ),
-            Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+            Err(e) => respond(upstream_status(&e), "text/plain", e.into_bytes(), "no-store"),
         },
         "/seg" => match load_segment(&target).await {
             Ok((ctype, bytes)) => {
                 segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin)
             }
-            Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+            Err(e) => respond(upstream_status(&e), "text/plain", e.into_bytes(), "no-store"),
         },
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),
     };
@@ -462,6 +501,45 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_requests_for_one_url_share_a_single_download() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let url = "https://cdn.example/coalesce/seg-1.ts";
+        let tasks: Vec<_> = (0..5)
+            .map(|_| {
+                tokio::spawn(fetch_shared_with(url, || async {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok((Some("video/mp2t".to_string()), vec![7u8; 1024]))
+                }))
+            })
+            .collect();
+        for task in tasks {
+            let (ctype, bytes) = task.await.unwrap().unwrap();
+            assert_eq!((ctype.as_deref(), bytes.len()), (Some("video/mp2t"), 1024));
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "5 overlapping requests download once");
+        assert!(INFLIGHT.lock().unwrap().get(url).is_none(), "no in-flight entry is left behind");
+        // 下载结束后的新请求会重新下载，不复用旧结果。
+        let _ = fetch_shared_with(url, || async {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok((None, Vec::new()))
+        })
+        .await;
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn permanent_upstream_rejections_keep_their_status() {
+        assert_eq!(upstream_status("HTTP 403 Forbidden"), 403);
+        assert_eq!(upstream_status("HTTP 404 Not Found"), 404);
+        assert_eq!(upstream_status("HTTP 429 Too Many Requests"), 502);
+        assert_eq!(upstream_status("HTTP 503 Service Unavailable"), 502);
+        assert_eq!(upstream_status("请求超时"), 502);
+        assert_eq!(upstream_status("封面解密失败"), 502);
+    }
 
     #[test]
     fn memory_cache_bounds_bytes_and_evicts_least_recently_used() {
