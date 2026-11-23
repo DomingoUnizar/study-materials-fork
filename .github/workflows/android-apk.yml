@@ -1,10 +1,11 @@
 name: Android APK (ARM64, debug-signed)
 
-# Manually triggered build of an installable ARM64 (arm64-v8a) APK, signed by Gradle with an
-# Android *debug* key. If the repository secret ANDROID_DEBUG_KEYSTORE_BASE64 is set (a base64
-# debug keystore: alias androiddebugkey, passwords "android"), every build uses that same key, so a
-# new APK installs over the previous one and keeps the app's data. Without it Gradle generates a
-# throw-away key on the runner (each build is signed differently). No release keystore is used.
+# Manually triggered build of an installable ARM64 (arm64-v8a) APK, signed with an Android *debug*
+# key. If the repository secret ANDROID_DEBUG_KEYSTORE_BASE64 is set (a base64 debug keystore:
+# alias androiddebugkey, passwords "android"), every build is re-signed with that same key, so a new
+# APK installs over the previous one and keeps the app's data. Without it the APK keeps the
+# throw-away key Gradle generates on the runner (each build is signed differently).
+# No release keystore is used.
 on:
   workflow_dispatch:
     inputs:
@@ -105,7 +106,8 @@ jobs:
             echo "CARGO_PROFILE_DEV_INCREMENTAL=false"
           } >> "$GITHUB_ENV"
 
-      # Optional fixed debug key (see the header); fails here, before the long build, if it can't be read.
+      # Optional fixed debug key (see the header): checked here, before the long build, and used to
+      # re-sign the APK after it.
       - name: Use the repository debug keystore (optional)
         env:
           DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
@@ -115,12 +117,11 @@ jobs:
             echo "::notice::ANDROID_DEBUG_KEYSTORE_BASE64 is not set: signing with a throw-away debug key (uninstall the old app before installing this APK)"
             exit 0
           fi
-          KS="${ANDROID_USER_HOME:-$HOME/.android}/debug.keystore"
-          mkdir -p "$(dirname "$KS")"
+          KS="$RUNNER_TEMP/debug.keystore"
           echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > "$KS"
           CERT="$(keytool -exportcert -keystore "$KS" -storepass android -alias androiddebugkey | sha256sum | cut -d' ' -f1)"
           echo "Debug certificate SHA-256: $CERT"
-          echo "FIXED_DEBUG_CERT=$CERT" >> "$GITHUB_ENV"
+          { echo "DEBUG_KEYSTORE=$KS"; echo "FIXED_DEBUG_CERT=$CERT"; } >> "$GITHUB_ENV"
 
       - name: Build debug APK (aarch64)
         run: pnpm tauri android build --debug --apk --target aarch64 --ci
@@ -136,6 +137,14 @@ jobs:
           mkdir -p artifacts
           cp "$SRC" "artifacts/$NAME"
           APK="artifacts/$NAME"
+
+          # Gradle signs with a debug key of its own; re-sign with the repository key when configured
+          # (apksigner replaces the existing signature, as the release workflow does for its APKs).
+          if [ -n "${FIXED_DEBUG_CERT:-}" ]; then
+            "$BUILD_TOOLS_DIR/apksigner" sign --ks "$DEBUG_KEYSTORE" --ks-key-alias androiddebugkey \
+              --ks-pass pass:android --key-pass pass:android --v4-signing-enabled false "$APK"
+            rm -f "$DEBUG_KEYSTORE"
+          fi
 
           echo "== Native libraries"
           unzip -l "$APK" | grep -E 'lib/[^/]+/.*\.so' | tee /tmp/libs.txt
