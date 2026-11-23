@@ -166,7 +166,7 @@ fn strip_padding(mut buf: Vec<u8>) -> Vec<u8> {
     buf
 }
 
-fn image_kind(buf: &[u8]) -> Option<&'static str> {
+pub(crate) fn image_kind(buf: &[u8]) -> Option<&'static str> {
     if buf.len() < 12 {
         return None;
     }
@@ -213,7 +213,7 @@ fn dec(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().to_string()
 }
 
-fn absolutize(base: &str, target: &str) -> String {
+pub(crate) fn absolutize(base: &str, target: &str) -> String {
     if target.starts_with("http://") || target.starts_with("https://") {
         return target.to_string();
     }
@@ -244,7 +244,7 @@ fn hls_attributes(line: &str) -> Option<(&str, Vec<&str>)> {
     Some((tag, attributes))
 }
 
-fn map_uri_attributes(line: &str, mut rewrite: impl FnMut(&str) -> String) -> String {
+pub(crate) fn map_uri_attributes(line: &str, mut rewrite: impl FnMut(&str) -> String) -> String {
     let Some((tag, attributes)) = hls_attributes(line) else {
         return line.to_string();
     };
@@ -369,6 +369,18 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     Ok((Some(mime), arc))
 }
 
+/// 离线下载用：同一地址正在下载时与播放合并请求，内存缓存里已有的 Key/分片直接复用；
+/// 下载结果不写入内存缓存，以免挤掉正在播放的内容。
+pub async fn download_bytes(url: &str) -> Result<Arc<Vec<u8>>, String> {
+    if let Some((_, hit)) = KEY_CACHE.lock().unwrap().get(url) {
+        return Ok(hit);
+    }
+    if let Some((_, hit)) = SEG_CACHE.lock().unwrap().get(url) {
+        return Ok(hit);
+    }
+    fetch_shared(url).await.map(|(_, bytes)| bytes)
+}
+
 /// 清空封面 / 播放列表 / 分片内存缓存
 pub fn clear_caches() {
     if let Ok(mut g) = IMG_CACHE.lock() { g.clear(); }
@@ -395,7 +407,7 @@ fn respond(status: u16, ctype: &str, body: Vec<u8>, cache: &str) -> Response<Vec
 
 /// 上游明确拒绝（签名过期、资源不存在）时保留原状态码，hls.js 不会重试 4xx；
 /// 超时、429、5xx 和网络错误仍按 502 返回，交给播放器重试。
-fn upstream_status(error: &str) -> u16 {
+pub(crate) fn upstream_status(error: &str) -> u16 {
     match error
         .strip_prefix("HTTP ")
         .and_then(|s| s.split_whitespace().next())
@@ -446,6 +458,14 @@ fn segment_response(
 /// `origin` 是本平台自定义协议的完整基址，见 [`LOCAL_ORIGIN`]；用于改写 m3u8 里的
 /// 分片与 key 地址。正常情况下调用方直接传 [`LOCAL_ORIGIN`]。
 pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> {
+    // 离线缓存的本地文件：不访问网络
+    if let Some(rest) = path.strip_prefix("/offline/") {
+        let rest = rest.to_string();
+        return match tokio::task::spawn_blocking(move || crate::offline::read(&rest)).await {
+            Ok(Some((ctype, body))) => respond(200, ctype, body, "no-store"),
+            _ => respond(404, "text/plain", b"not cached".to_vec(), "no-store"),
+        };
+    }
     let target = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("u="))

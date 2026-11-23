@@ -13,6 +13,7 @@ const viewport = { width: 412, height: 915 };
 const userAgent = "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
 const report = { device: `Android UA, ${viewport.width}x${viewport.height}, touch`, passed: [], metrics: {} };
 const stalled = [];
+const mediaRequests = [];
 let vite, browser, page;
 try {
   vite = await createServer({ root, logLevel: "error", server: { host: "127.0.0.1", port: 0, strictPort: false } });
@@ -26,7 +27,8 @@ try {
   await page.route("**/*", route => {
     const url = new URL(route.request().url());
     if (url.origin === new URL(origin).origin) return route.continue();
-    if (url.hostname === "hg.localhost" && url.pathname === "/hls") {
+    if (url.hostname === "hg.localhost" && (url.pathname === "/hls" || url.pathname.endsWith(".m3u8"))) {
+      mediaRequests.push(url.pathname);
       // A valid playlist whose only segment never arrives: the player stays loading, without an error overlay.
       return route.fulfill({ status: 200, contentType: "application/vnd.apple.mpegurl", headers: { "Access-Control-Allow-Origin": "*" },
         body: "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nhttp://hg.localhost/seg?u=seg0\n#EXT-X-ENDLIST\n" });
@@ -88,6 +90,65 @@ try {
   await ep3.click();
   await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 3));
   report.passed.push("Fullscreen: mute toggles; episodes button opens the sheet above the fullscreen layer and switches episodes");
+
+  // Offline cache: a cached episode plays from local files; online playback pauses downloads; the
+  // cache sheet queues only episodes that are neither cached nor downloading.
+  const offlineCalls = () => page.evaluate(() => window.apiLoadingFixture.feedCalls.filter(r => r.cmd.startsWith("offline_")).map(r => ({ cmd: r.cmd, args: r.args })));
+  const until = async (check, what) => {
+    for (let i = 0; i < 100 && !(await check()); i++) await new Promise(r => setTimeout(r, 50));
+    assert(await check(), what);
+  };
+  await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile&offline=1`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await page.evaluate(() => window.apiLoadingFixture.complete("api_feed", "", "item"));
+  await until(() => mediaRequests.includes("/offline/991/1/index.m3u8"), "Cached episode loads its local playlist");
+  assert.deepEqual(await plays(), [], "Cached episode must not request a play address");
+  assert(!(await offlineCalls()).some(c => c.cmd === "offline_set_paused" && c.args.paused), "Local playback keeps downloads running");
+  await page.getByRole("button", { name: "缓存", exact: true }).click();
+  const cacheRest = page.getByRole("button", { name: /缓存本剧剩余 2 集/ });
+  await cacheRest.waitFor({ state: "visible" });
+  assert(await page.getByRole("button", { name: /缓存本集（第 1 集）/ }).isDisabled(), "A cached episode cannot be queued again");
+  await cacheRest.click();
+  await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_enqueue"), "Cache sheet queues episodes");
+  const enqueued = (await offlineCalls()).find(c => c.cmd === "offline_enqueue").args;
+  assert.deepEqual([enqueued.vid, enqueued.eps], [991, [3, 4]], "Only episodes neither cached nor downloading are queued");
+  await cacheRest.waitFor({ state: "detached" }); // the closing sheet's backdrop would swallow the swipe
+  await swipe(100, 300);
+  await page.waitForFunction(() => document.querySelectorAll("section").length === 4);
+  await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
+  await until(async () => (await plays()).includes(2), "Uncached episode 2 requests a play address");
+  await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_set_paused" && c.args.paused === true), "Online playback pauses downloads");
+  report.metrics.offline = { local_playlists: mediaRequests.filter(u => u.startsWith("/offline/")), queued: enqueued.eps };
+  report.passed.push("Offline: cached episode plays locally without a play request; cache sheet queues episodes 3-4; online playback pauses downloads");
+
+  // Favourites load in batches of 12 as the list scrolls; every detail is requested once.
+  await page.evaluate(() => localStorage.setItem("hghub_app_v1", JSON.stringify({ favs: Array.from({ length: 30 }, (_, i) => 5000 + i) })));
+  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&detail=episodes`);
+  const videoCalls = () => page.evaluate(() => window.apiLoadingFixture.feedCalls.filter(r => r.cmd === "api_video").map(r => r.args.id));
+  await until(async () => (await videoCalls()).length >= 12, "First batch of favourites loads");
+  await page.waitForTimeout(400);
+  const firstLoad = (await videoCalls()).length;
+  assert(firstLoad < 30, `Favourites must not all load at once (${firstLoad})`);
+  for (let i = 0; i < 8 && (await videoCalls()).length < 30; i++) {
+    await page.evaluate(() => { const el = document.querySelector(".scroll-y"); el.scrollTop = el.scrollHeight; });
+    await page.waitForTimeout(250);
+  }
+  const ids = await videoCalls();
+  assert.equal(ids.length, 30, "Scrolling reaches every favourite");
+  assert.equal(new Set(ids).size, 30, "No favourite detail is requested twice");
+  report.metrics.favourites = { total: 30, loaded_before_scrolling: firstLoad };
+  report.passed.push("Profile: 30 favourites load in batches of 12 while scrolling, each detail requested once");
+  await page.evaluate(() => localStorage.clear());
+
+  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&offline=1`);
+  await page.getByRole("button", { name: "离线缓存", exact: true }).click();
+  await page.getByText("测试短剧", { exact: true }).waitFor({ state: "visible" });
+  await page.getByText(/已缓存 1\/2 集/).waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "删除缓存", exact: true }).click();
+  await page.getByRole("button", { name: "确认删除", exact: true }).click();
+  await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_delete" && c.args.vid === 991 && c.args.ep === null), "Delete removes the whole series");
+  await page.getByText("还没有离线缓存", { exact: true }).waitFor({ state: "visible" });
+  report.passed.push("Profile: offline tab lists the cached series with progress; delete needs a second tap");
 
   assert.deepEqual(errors, [], "No page errors");
   await page.screenshot({ path: join(output, "final.png") });

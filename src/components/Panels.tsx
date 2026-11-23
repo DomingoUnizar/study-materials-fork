@@ -1,10 +1,55 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, fmt, cover as imageCover } from "../api";
 import { handleArticleClick, sanitizeHtml } from "../html";
-import type { Comment, CommentPage, Episode } from "../types";
+import type { Comment, CommentPage, Detail, Episode } from "../types";
 import { useStore } from "../store";
+import { cacheEpisodes, useOffline, type OfflineEpisode } from "../offline";
 import { Avatar, Empty } from "./ui";
 import { IClose, IHeart, ISendF } from "../icons";
+
+/** 一集缓存状态的简短说明；没有缓存记录时返回空串 */
+export function offlineLabel(e?: OfflineEpisode) {
+  if (!e) return "";
+  if (e.state === "done") return "已缓存";
+  if (e.state === "error") return "失败，点此重试";
+  if (e.state === "downloading") return e.total ? `下载中 ${Math.floor((e.done / e.total) * 100)}%` : "下载中";
+  return "排队中";
+}
+
+/* ================= 离线缓存（播放页） ================= */
+export function CachePanel({ detail, curEp, onClose }: { detail?: Detail; curEp: number; onClose: () => void }) {
+  const { toast } = useStore();
+  const { episodes: cached } = useOffline();
+  if (!detail?.episodes?.length) {
+    return <div className="px-4 pb-6 pt-2 text-[12px] text-mut">选集还没加载好，稍后再试</div>;
+  }
+  const stateOf = (ep: number) => cached[`${detail.id}:${ep}`];
+  const current = stateOf(curEp);
+  const rest = detail.episodes.map((e) => e.ep_num).filter((n) => n > curEp && (!stateOf(n) || stateOf(n)?.state === "error"));
+  const add = async (eps: number[]) => {
+    try {
+      await cacheEpisodes(detail, eps);
+      toast(eps.length > 1 ? `已加入 ${eps.length} 集` : "已加入缓存队列", "ok");
+      onClose();
+    } catch (e) {
+      toast(typeof e === "string" ? e : (e as Error).message || "加入缓存失败", "info");
+    }
+  };
+  const row = "w-full h-12 mt-2 px-4 rounded-(--r-ctl) bg-s3 flex items-center justify-between text-[13px] font-semibold text-on pressable disabled:opacity-50";
+  return (
+    <div className="px-4 pb-5">
+      <div className="text-[14px] font-bold text-on">离线缓存</div>
+      <div className="text-[11px] text-mut mt-1 leading-relaxed">缓存后可离线观看。一次只下载一个文件，在线播放时自动暂停；在「我的 → 离线缓存」查看和删除。</div>
+      <button onClick={() => void add([curEp])} disabled={!!current && current.state !== "error"} className={row}>
+        <span>缓存本集（第 {curEp} 集）</span>
+        <span className="text-[11.5px] font-normal text-mut">{offlineLabel(current)}</span>
+      </button>
+      <button onClick={() => void add(rest)} disabled={!rest.length} className={row}>
+        <span>{rest.length ? `缓存本剧剩余 ${rest.length} 集` : "后面的集都已在缓存中"}</span>
+      </button>
+    </div>
+  );
+}
 
 /* ================= 选集 ================= */
 export function EpisodesPanel({ videoId, episodes, current, onPick, onClose, bare = false }: {

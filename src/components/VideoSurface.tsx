@@ -173,8 +173,9 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         preferManagedMediaSource: false,
         autoStartLoad: false,
         lowLatencyMode: false,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
+        // 前向缓冲 60 秒：上游偶尔变慢时多攒一些再播，减少卡顿（内存上限仍由 hls.js 的 maxBufferSize 约束）
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
         backBufferLength: 30,
         maxBufferHole: 0.5,
         highBufferWatchdogPeriod: 2,

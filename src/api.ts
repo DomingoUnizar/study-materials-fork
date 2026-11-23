@@ -78,8 +78,9 @@ export const api = {
   me: () => call<User>("api_me"),
 
   feed: (page = 1, size = 20) => call<Paged<VideoCard>>("api_feed", { page, size }),
-  category: (cate: string, page = 1, size = 20) =>
-    call<Paged<VideoCard>>("api_category", { cate, page, size }),
+  /** sort="new" 让上游按上架时间倒序；不传则是上游默认的热度顺序 */
+  category: (cate: string, page = 1, size = 20, sort?: "new") =>
+    call<Paged<VideoCard>>("api_category", { cate, page, size, sort: sort ?? null }),
   rank: (kind: "hot" | "recommend" | "potential") =>
     call<{ type: string; items: RankItem[] }>("api_rank", { kind }),
   search: (q: string, page = 1, size = 20) =>

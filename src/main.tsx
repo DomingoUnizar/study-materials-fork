@@ -5,9 +5,11 @@ import { AppProvider } from "./store";
 import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
 import { initPlaybackLog, installPlaybackPageEvents } from "./playbackDiagnostics";
+import { initOffline } from "./offline";
 
 installPlaybackPageEvents();
 void initPlaybackLog();
+initOffline();
 
 /* 运行期错误统一落到 debug.log，便于自查 */
 function report(kind: string, msg: string) {

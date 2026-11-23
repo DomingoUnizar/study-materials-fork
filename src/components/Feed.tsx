@@ -7,10 +7,11 @@ import { Avatar, Img, Sheet } from "./ui";
 import VideoSurface, { type VideoHandle } from "./VideoSurface";
 import PlayerControls from "./PlayerControls";
 import PlaybackLock from "./PlaybackLock";
-import { ArticlePanel, CommentsPanel, EpisodesPanel } from "./Panels";
+import { ArticlePanel, CachePanel, CommentsPanel, EpisodesPanel } from "./Panels";
+import { isOffline, isOfflineUrl, offlineSeries, offlineUrl, setStreaming, useOffline } from "../offline";
 import { setBackHandler } from "../back";
 import {
-  IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
+  IBack, IBoltF, ICheck, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IDownload, IExpand, IFileText, IHeart, IHeartF,
   ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
 } from "../icons";
 
@@ -34,7 +35,7 @@ type Props = {
 
 export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, startEp, startTime }: Props) {
   const store = useStore();
-  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
+  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user } = store;
   const isDesktop = !isMobile;
 
   const boxRef = useRef<HTMLDivElement>(null);
@@ -57,7 +58,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [err, setErr] = useState("");
   /* 取播放地址失败后手动重试：递增即重新触发拉取 */
   const [playTry, setPlayTry] = useState(0);
-  const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | null>(null);
+  const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | "cache" | null>(null);
+  useOffline(); // 缓存进度变化时刷新「缓存」按钮状态
   const [descOpen, setDescOpen] = useState(false);
   /* 续播：拿到时长后再 seek 一次（只对进入时那一条生效） */
   const resumeRef = useRef<{ key: string; t: number } | null>(
@@ -130,6 +132,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const curEp = epMap[curId] || 1;
   const playKey = `${curId}:${curEp}`;
   const playUrl = playUrls[playKey] || "";
+  const cachedHere = kind === "video" && isOffline(curId, curEp);
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
   /* 剧集模式（移动端）：右划进入当前这部剧，竖向列表换成本剧各集；左划回到原列表，该剧停在刚看的那一集 */
@@ -364,7 +367,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       requestedDetails.current.add(id);
       api.video(id)
         .then((d) => setDetails((m) => ({ ...m, [id]: d })))
-        .catch(() => { requestedDetails.current.delete(id); });
+        .catch(() => {
+          requestedDetails.current.delete(id);
+          // 离线时退回缓存时保存的剧集信息（标题、选集列表）
+          const cached = offlineSeries(id);
+          if (cached) setDetails((m) => (m[id] ? m : { ...m, [id]: cached }));
+        });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index, videoIds]);
@@ -387,6 +395,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   useEffect(() => {
     if (!curId) return;
     if (playUrls[playKey]) return;
+    // 已缓存的集直接读本地，不向上游请求播放地址
+    if (isOffline(curId, curEp)) {
+      setPlayUrls((m) => ({ ...m, [playKey]: offlineUrl(curId, curEp) }));
+      addHistory(curId, curEp);
+      return;
+    }
     let alive = true;
     api.play(curId, curEp)
       .then((info) => {
@@ -399,6 +413,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curId, curEp, playTry]);
+
+  /* 在线播放时暂停离线下载，避免和播放抢带宽；播放本地缓存、暂停或离开页面时恢复 */
+  const streamId = useRef(`feed-${Math.random().toString(36).slice(2)}`);
+  useEffect(() => {
+    setStreaming(streamId.current, active && !paused && !!playUrl && !isOfflineUrl(playUrl));
+  }, [active, paused, playUrl]);
+  useEffect(() => () => setStreaming(streamId.current, false), []);
 
   /* 播放地址带时效签名（auth_key），停留或暂停过久会过期：手动「重新加载」时换取新地址，并从当前位置续播 */
   const reloadWithFreshUrl = () => {
@@ -759,21 +780,22 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     } catch { toast("画中画开启失败", "info"); }
   };
 
-  const requireLogin = () => { if (!user) { setLoginOpen(true); return false; } return true; };
+  /* 游客模式：点赞/收藏/关注只记在本地，不弹登录；已登录时再同步到服务端 */
+  const synced = () => !!user;
 
   const onLike = () => {
     if (!curId) return;
     const on = toggleLikeLocal(curId);
     setHeartBurst((n) => n + 1);
     toast(on ? "已加入喜欢" : "已取消喜欢", on ? "heart" : "info");
-    if (requireLogin()) { if (kind === "post") api.postLike(curId, on).catch(() => {}); else api.like(curId, curEp, on).catch(() => {}); }
+    if (synced()) { if (kind === "post") api.postLike(curId, on).catch(() => {}); else api.like(curId, curEp, on).catch(() => {}); }
   };
 
   const onFav = () => {
     if (!curId) return;
     const on = toggleFavLocal(curId);
     toast(on ? "已收藏" : "已取消收藏", on ? "star" : "info");
-    if (requireLogin()) { if (kind === "post") api.postCollect(curId, on).catch(() => {}); else api.collect(curId, on).catch(() => {}); }
+    if (synced()) { if (kind === "post") api.postCollect(curId, on).catch(() => {}); else api.collect(curId, on).catch(() => {}); }
   };
 
   const onFollow = () => {
@@ -781,7 +803,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (!uid) return;
     const on = toggleFollowLocal(uid);
     toast(on ? `已关注 ${detail?.author?.name}` : "已取消关注", on ? "ok" : "info");
-    if (requireLogin()) api.follow(uid, on).catch(() => {});
+    if (synced()) api.follow(uid, on).catch(() => {});
   };
 
   const pickEp = (ep: number) => {
@@ -1102,6 +1124,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     <ILink size={25} className="hg-ink hg-ov-shadow" />
                     <span className="text-[10.5px] hg-ink-2 hg-ov-shadow">分享</span>
                   </button>
+                  {kind === "video" && (
+                    <button onClick={() => setPanel("cache")} className="flex flex-col items-center gap-1 pressable" aria-label="缓存">
+                      {cachedHere ? <ICheck size={25} className="hg-ink hg-ov-shadow" /> : <IDownload size={25} className="hg-ink hg-ov-shadow" />}
+                      <span className="text-[10.5px] hg-ink-2 hg-ov-shadow">{cachedHere ? "已缓存" : "缓存"}</span>
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -1262,6 +1290,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
             <div className="flex flex-col" style={{ height: "72vh" }}>
               <CommentsPanel videoId={curId} ep={curEp} total={meta.comment} kind={kind} onClose={() => setPanel(null)} />
             </div>
+          </Sheet>
+
+          {/* 离线缓存：本集 / 本剧剩余集 */}
+          <Sheet open={panel === "cache"} onClose={() => setPanel(null)}>
+            <CachePanel detail={detail} curEp={curEp} onClose={() => setPanel(null)} />
           </Sheet>
 
           {/* 吃瓜图文正文 */}

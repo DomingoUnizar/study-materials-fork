@@ -1,7 +1,9 @@
 import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import Home from "../src/pages/Home";
-import Category from "../src/pages/Category";
+import Category, { ChannelPage } from "../src/pages/Category";
+import Profile from "../src/pages/Profile";
+import { initOffline } from "../src/offline";
 import { AppProvider, useStore } from "../src/store";
 import "../src/index.css";
 
@@ -9,6 +11,15 @@ type Request = { cmd: string; args: Record<string, unknown>; resolve: (value: un
 const params = new URLSearchParams(location.search);
 const signedPlayUrls = params.get("play") === "signed";
 const withEpisodes = params.get("detail") === "episodes";
+// Offline cache fixture: series 991, episode 1 cached, episode 2 still downloading.
+const offlineList = params.get("offline") === "1" ? {
+  episodes: [
+    { vid: 991, ep: 1, title: "测试短剧", state: "done", done: 3, total: 3, bytes: 3 * 1024 * 1024, seq: 1 },
+    { vid: 991, ep: 2, title: "测试短剧", state: "downloading", done: 1, total: 2, bytes: 1024 * 1024, seq: 2 },
+  ],
+  series: { 991: { id: 991, title: "测试短剧", cover: "", description: "", tags: [], score: 0, episode_count: 4, total_episodes: 4,
+    episodes: [1, 2, 3, 4].map(ep_num => ({ ep_num, title: `第${ep_num}集`, duration: 60, status: 1 })) } },
+} : { episodes: [], series: {} };
 const pending: Request[] = [];
 const fixture = {
   history: [] as { cmd: string; args: Record<string, unknown> }[],
@@ -43,6 +54,10 @@ Object.assign(window, {
     if (cmd === "app_boot") return Promise.resolve({ user: null, logged_in: false, base: "https://fixture.invalid" });
     if (cmd === "debug_log") { fixture.debug.push(String(args.msg)); return Promise.resolve(); }
     // Feed detail/play requests fail like an unavailable upstream; record them to count re-requests.
+    if (cmd.startsWith("offline_")) {
+      fixture.feedCalls.push({ cmd, args });
+      return Promise.resolve(cmd === "offline_list" ? offlineList : null);
+    }
     if (cmd === "api_video" || cmd === "api_play") {
       fixture.feedCalls.push({ cmd, args });
       if (cmd === "api_video" && withEpisodes) {
@@ -75,12 +90,15 @@ function Fixture() {
   const [active, setActive] = useState(false);
   fixture.setActive = setActive;
   fixture.ready = true;
-  const home = new URLSearchParams(location.search).get("page") === "home";
+  const page = params.get("page");
   return <AppProvider>
     <StoreProbe />
     <div style={params.get("layout") === "mobile" ? { position: "fixed", inset: 0 } : { position: "relative", width: 900, height: 1000 }}>
-      {home ? <Home active bottomInset={0} /> : <Category wide active={active} />}
+      {page === "home" ? <Home active bottomInset={0} /> : page === "profile" ? <Profile wide={false} />
+        : page === "channel" ? <ChannelPage cate="ai-duanju" name="AI成人短剧" onBack={() => {}} wide />
+        : <Category wide active={active} />}
     </div>
   </AppProvider>;
 }
+initOffline();
 createRoot(document.querySelector("#root")!).render(<React.StrictMode><Fixture /></React.StrictMode>);

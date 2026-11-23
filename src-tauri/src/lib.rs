@@ -6,6 +6,7 @@ mod macos_titlebar;
 mod media;
 mod net;
 mod network_policy;
+mod offline;
 mod playback_log;
 mod session;
 
@@ -44,9 +45,26 @@ pub fn run() {
                 // 上次选择的线路（设置 → 线路）在启动时恢复
                 net::bind_base(&dir);
                 playback_log::bind(&dir);
+                offline::bind(dir.join("offline"));
                 let state: tauri::State<Api> = app.state();
                 state.session.bind(dir);
             }
+            // 离线下载队列：队列空或在线播放时等待唤醒，一次只下载一个文件（见 offline.rs）
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(offline::run_worker(
+                {
+                    let handle = handle.clone();
+                    move |vid, ep| {
+                        let handle = handle.clone();
+                        async move { api::play_url(&handle, vid, ep).await }
+                    }
+                },
+                |url: String| async move { media::download_bytes(&url).await },
+                move |ep: &offline::Episode| {
+                    use tauri::Emitter;
+                    let _ = handle.emit("offline-progress", ep);
+                },
+            ));
             // macOS 主窗口在此创建：先按系统红绿灯尺寸算出居中位置（见 macos_titlebar.rs）
             #[cfg(target_os = "macos")]
             macos_titlebar::create_main_window(app)?;
@@ -136,6 +154,10 @@ pub fn run() {
             api::api_rank,
             api::api_search,
             api::cache_clear,
+            api::offline_list,
+            api::offline_enqueue,
+            api::offline_delete,
+            api::offline_set_paused,
             api::api_posts,
             api::api_post,
             api::api_post_like,

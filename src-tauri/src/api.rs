@@ -438,10 +438,13 @@ pub async fn api_category(
     cate: String,
     page: u32,
     size: u32,
+    sort: Option<String>,
 ) -> Result<Value, String> {
+    // 只透传上游支持的 sort=new（按上架时间倒序）；不传时上游按热度排序
+    let sort = if sort.as_deref() == Some("new") { "&sort=new" } else { "" };
     state
         .get(&format!(
-            "/api/videos/category/{cate}?page={page}&size={size}"
+            "/api/videos/category/{cate}?page={page}&size={size}{sort}"
         ))
         .await
 }
@@ -515,6 +518,21 @@ fn has_play_url(info: &Value) -> bool {
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
+    play_info(&state, id, ep).await
+}
+
+/// 离线下载用：取一集当前有效的播放地址（签名有时效，每次下载/续传前重新取）。
+pub async fn play_url(app: &tauri::AppHandle, id: i64, ep: u32) -> Result<String, String> {
+    use tauri::Manager;
+    let info = play_info(&app.state::<Api>(), id, ep).await?;
+    info.get("video_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "暂无播放地址".to_string())
+}
+
+async fn play_info(state: &Api, id: i64, ep: u32) -> Result<Value, String> {
     // 优先走新接口；失败或没有可用地址时再退回旧接口，两者都不行就返回新接口的结果/错误。
     let primary = state
         .post(&format!("/api/videos/{id}/episodes/{ep}/playback"), Some(json!({})))
@@ -542,6 +560,47 @@ pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, 
         }
         Err(_) => primary,
     }
+}
+
+/* ───────────────────────── 离线缓存 ───────────────────────── */
+
+#[tauri::command]
+pub async fn offline_list() -> Result<Value, String> {
+    crate::offline::list()
+}
+
+/// 把若干集加入离线下载队列（见 offline.rs）；封面只下载一次存本地，离线列表也能显示。
+#[tauri::command]
+pub async fn offline_enqueue(
+    app: tauri::AppHandle,
+    vid: i64,
+    eps: Vec<u32>,
+    title: String,
+    cover: String,
+    detail: Value,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    for ep in crate::offline::enqueue(vid, &eps, &title, &detail)? {
+        let _ = app.emit("offline-progress", &ep);
+    }
+    if !cover.is_empty() && !crate::offline::has_cover(vid) {
+        if let Ok((_, bytes)) = crate::media::load_image(&cover).await {
+            let _ = crate::offline::save_cover(vid, &bytes);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn offline_delete(vid: i64, ep: Option<u32>) -> Result<(), String> {
+    crate::offline::delete(vid, ep)
+}
+
+/// 在线播放时暂停离线下载，避免和播放抢带宽。
+#[tauri::command]
+pub async fn offline_set_paused(paused: bool) -> Result<(), String> {
+    crate::offline::set_paused(paused);
+    Ok(())
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */

@@ -118,6 +118,17 @@ try {
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
   assert.equal((await calls()).length, 6, "Revisiting must preserve previews without reloading all channels");
   report.passed.push("Category: defer hidden loading, show successful rows/posts before slow row, independent error/retry, preserve data on revisit");
+  // Channel sorting: 「最新」asks upstream for newest first; 「最热」is upstream's default order; 「高分」re-sorts locally.
+  await page.goto(`${origin}tests/api-loading.html?page=channel`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  assert.equal((await calls())[0].args.sort, "new", "最新 requests sort=new");
+  await page.getByRole("button", { name: "最热", exact: true }).click();
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 2);
+  assert.equal((await calls())[1].args.sort, null, "最热 uses the default upstream order");
+  await page.getByRole("button", { name: "高分", exact: true }).click();
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 300)));
+  assert.equal((await calls()).length, 2, "高分 only re-sorts what is loaded");
+  report.passed.push("Channel: 最新 uses upstream sort=new, 最热 the default order, 高分 sorts locally");
   assert.deepEqual(errors, [], "No page errors");
   assert.deepEqual(report.external, [], "No upstream traffic");
   await page.screenshot({ path: join(output, "final.png"), fullPage: true });

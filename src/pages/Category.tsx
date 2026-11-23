@@ -155,21 +155,26 @@ function PreviewStatus({ name, loading, error, onRetry }: { name: string; loadin
 export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: string; onBack: () => void; wide: boolean }) {
   const { push } = useStore();
   const [sort, setSort] = useState<"最新" | "最热" | "高分">("最新");
+  /* 「最新」交给上游按上架时间排（sort=new）；「最热」就是上游默认顺序；「高分」上游不支持，只对已加载部分排序 */
+  const order = sort === "最新" ? "new" : undefined;
   const [items, setItems] = useState<VideoCard[]>([]);
   const [page, setPage] = useState(0);
   const [pages, setPages] = useState(1);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const busy = useRef(false);
+  const gen = useRef(0);
   const sentinel = useRef<HTMLDivElement>(null);
 
   const loadMore = async () => {
     if (busy.current || page >= pages) return;
     busy.current = true;
     setLoading(true);
+    const g = gen.current;
     try {
       const next = page + 1;
-      const res = await api.category(cate, next, 20);
+      const res = await api.category(cate, next, 20, order);
+      if (g !== gen.current) return;
       setItems((prev) => {
         const seen = new Set(prev.map((x) => x.id));
         return [...prev, ...(res?.items || []).filter((x) => !seen.has(x.id))];
@@ -178,14 +183,28 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
       setPages(res?.pagination?.pages || next);
       setErr(null);
     } catch (e) {
-      setErr((e as Error).message || "加载失败");
+      if (g === gen.current) setErr((e as Error).message || "加载失败");
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (g === gen.current) {
+        busy.current = false;
+        setLoading(false);
+      }
     }
   };
 
-  useEffect(() => { loadMore(); /* eslint-disable-next-line */ }, []);
+  /* 切换上游排序时清空重来，旧排序还没返回的结果作废（首次挂载不重置） */
+  const lastOrder = useRef(order);
+  useEffect(() => {
+    if (lastOrder.current === order) return;
+    lastOrder.current = order;
+    gen.current += 1;
+    busy.current = false;
+    setItems([]);
+    setPage(0);
+    setPages(1);
+    setErr(null);
+  }, [order]);
+  useEffect(() => { if (page === 0) loadMore(); /* eslint-disable-next-line */ }, [page, order]);
   useEffect(() => {
     const el = sentinel.current;
     if (!el) return;
@@ -198,7 +217,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
   const sorted = [...items].sort((a, b) => {
     if (sort === "最热") return (b.hot || 0) - (a.hot || 0);
     if (sort === "高分") return (b.score || 0) - (a.score || 0);
-    return b.id - a.id;
+    return 0; // 「最新」保持上游按上架时间返回的顺序
   });
 
   return (
