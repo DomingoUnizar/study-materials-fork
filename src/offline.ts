@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useSyncExternalStore } from "react";
 import { LOCAL } from "./api";
+import { cacheHevc } from "./hevc";
 import type { Detail } from "./types";
 
 /** 一集的离线缓存状态（与 src-tauri/src/offline.rs 的 Episode 一致） */
@@ -54,7 +55,8 @@ export function initOffline() {
 
 /** 把若干集加入离线下载队列 */
 export async function cacheEpisodes(detail: Detail, eps: number[]) {
-  await invoke("offline_enqueue", { vid: detail.id, eps, title: detail.title, cover: detail.cover || "", detail });
+  // 本机播放过 hevc 的设备缓存 hevc 流（同分辨率、体积约一半）
+  await invoke("offline_enqueue", { vid: detail.id, eps, title: detail.title, cover: detail.cover || "", detail, hevc: cacheHevc() });
   publish({ ...snapshot, series: { ...snapshot.series, [detail.id]: detail } });
 }
 

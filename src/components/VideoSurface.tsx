@@ -244,7 +244,11 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
           onError?.(`${data.type}/${data.details}`);
           hls.startLoad();
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          if (recoverCountRef.current < 4) {
+          // 设备解不了流声明的编码（如 HEVC 的某个档次）：恢复解码器无济于事，清单级的这个错误也不会再报，
+          // 静默恢复只会一直转圈；直接报错（Feed 播 hevc 时据此自动换回 H.264）
+          const unsupported = data.details === Hls.ErrorDetails.MANIFEST_INCOMPATIBLE_CODECS_ERROR
+            || data.details === Hls.ErrorDetails.BUFFER_INCOMPATIBLE_CODECS_ERROR;
+          if (!unsupported && recoverCountRef.current < 4) {
             recoverCountRef.current += 1;
             try {
               if (recoverCountRef.current === 2) hls.swapAudioCodec();

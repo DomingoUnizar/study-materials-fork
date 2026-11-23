@@ -11,6 +11,8 @@ type Request = { cmd: string; args: Record<string, unknown>; resolve: (value: un
 const params = new URLSearchParams(location.search);
 const signedPlayUrls = params.get("play") === "signed";
 const withEpisodes = params.get("detail") === "episodes";
+// Upstream also offers an hevc stream for every episode (same resolution, about half the bitrate).
+const hevcStreams = params.get("hevc") === "1";
 // Offline cache fixture: series 991, episode 1 cached, episode 2 still downloading.
 const offlineList = params.get("offline") === "1" ? {
   episodes: [
@@ -69,7 +71,10 @@ Object.assign(window, {
       if (cmd === "api_play" && signedPlayUrls) {
         // Every play request returns a freshly signed address, as the upstream does.
         const n = fixture.feedCalls.filter(r => r.cmd === "api_play").length;
-        return Promise.resolve({ video_url: `https://cdn.fixture.invalid/ep1.m3u8?auth_key=${n}` });
+        return Promise.resolve({
+          video_url: `https://cdn.fixture.invalid/ep1.m3u8?auth_key=${n}`,
+          ...(hevcStreams ? { video_url_hevc: `https://cdn.fixture.invalid/ep1-hevc.m3u8?auth_key=${n}` } : {}),
+        });
       }
       return Promise.reject("HTTP 503 Gateway: <html><h1>nginx error</h1></html>");
     }

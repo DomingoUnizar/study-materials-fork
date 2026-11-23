@@ -14,6 +14,8 @@ const userAgent = "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (
 const report = { device: `Android UA, ${viewport.width}x${viewport.height}, touch`, passed: [], metrics: {} };
 const stalled = [];
 const mediaRequests = [];
+const playlists = []; // upstream address behind every proxied playlist request
+let hevcFailure = "403"; // how the hevc stream fails: "403" on its playlist, or "codec" (declares a codec the device cannot decode)
 let vite, browser, page;
 try {
   vite = await createServer({ root, logLevel: "error", server: { host: "127.0.0.1", port: 0, strictPort: false } });
@@ -29,6 +31,14 @@ try {
     if (url.origin === new URL(origin).origin) return route.continue();
     if (url.hostname === "hg.localhost" && (url.pathname === "/hls" || url.pathname.endsWith(".m3u8"))) {
       mediaRequests.push(url.pathname);
+      const upstream = url.searchParams.get("u") || "";
+      if (url.pathname === "/hls") playlists.push(upstream);
+      const hevc = upstream.includes("-hevc.m3u8");
+      if (hevc && hevcFailure === "403") return route.fulfill({ status: 403, headers: { "Access-Control-Allow-Origin": "*" }, body: "forbidden" });
+      if (hevc && hevcFailure === "codec") {
+        return route.fulfill({ status: 200, contentType: "application/vnd.apple.mpegurl", headers: { "Access-Control-Allow-Origin": "*" },
+          body: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1326000,RESOLUTION=720x1254,CODECS="hvc1.2.4.L93.90"\nhttp://hg.localhost/hls?u=hevc-media\n' });
+      }
       // A valid playlist whose only segment never arrives: the player stays loading, without an error overlay.
       return route.fulfill({ status: 200, contentType: "application/vnd.apple.mpegurl", headers: { "Access-Control-Allow-Origin": "*" },
         body: "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nhttp://hg.localhost/seg?u=seg0\n#EXT-X-ENDLIST\n" });
@@ -94,8 +104,8 @@ try {
   // Offline cache: a cached episode plays from local files; online playback pauses downloads; the
   // cache sheet queues only episodes that are neither cached nor downloading.
   const offlineCalls = () => page.evaluate(() => window.apiLoadingFixture.feedCalls.filter(r => r.cmd.startsWith("offline_")).map(r => ({ cmd: r.cmd, args: r.args })));
-  const until = async (check, what) => {
-    for (let i = 0; i < 100 && !(await check()); i++) await new Promise(r => setTimeout(r, 50));
+  const until = async (check, what, tries = 100) => {
+    for (let i = 0; i < tries && !(await check()); i++) await new Promise(r => setTimeout(r, 50));
     assert(await check(), what);
   };
   await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile&offline=1`);
@@ -149,6 +159,63 @@ try {
   await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_delete" && c.args.vid === 991 && c.args.ep === null), "Delete removes the whole series");
   await page.getByText("还没有离线缓存", { exact: true }).waitFor({ state: "visible" });
   report.passed.push("Profile: offline tab lists the cached series with progress; delete needs a second tap");
+
+  // HEVC: an Android device that reports HEVC support tries the hevc stream first (same resolution, about
+  // half the bitrate); when it fails, the same episode switches to H.264 without the error overlay. A decode
+  // failure stops preferring HEVC on this device, a network failure does not. Offline caching uses hevc only
+  // once hevc has actually played on this device.
+  await page.addInitScript(() => {
+    if (!location.search.includes("hevc=1")) return;
+    // The simulated device decodes HEVC Main (what the app checks) but no other HEVC profile, whatever the host supports.
+    const original = MediaSource.isTypeSupported.bind(MediaSource);
+    MediaSource.isTypeSupported = type => /(hvc1|hev1)\.1\.6\.L120/.test(type) || (!/hvc1|hev1/.test(type) && original(type));
+  });
+  const openHevcFeed = async failure => {
+    hevcFailure = failure;
+    playlists.length = 0;
+    await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile&hevc=1`);
+    await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+    await page.evaluate(() => window.apiLoadingFixture.complete("api_feed", "", "item"));
+  };
+  const usesMain = () => playlists.some(u => u.includes("/ep1.m3u8"));
+  const errorOverlays = () => page.getByRole("button", { name: "重新加载" }).count();
+  const cacheThisEpisode = async () => {
+    const queued = async () => (await offlineCalls()).filter(c => c.cmd === "offline_enqueue");
+    const before = (await queued()).length;
+    await page.getByRole("button", { name: "缓存", exact: true }).click();
+    const button = page.getByRole("button", { name: /缓存本集（第 1 集）/ });
+    await button.click();
+    await until(async () => (await queued()).length > before, "Cache sheet queues the episode");
+    await button.waitFor({ state: "detached" });
+    return (await queued()).at(-1).args.hevc;
+  };
+
+  await openHevcFeed("403");
+  await until(usesMain, "Rejected hevc playlist falls back to H.264");
+  const networkFallback = playlists.map(u => u.split("?")[0].split("/").pop());
+  assert.equal(networkFallback[0], "ep1-hevc.m3u8", `The hevc playlist is tried first: ${networkFallback}`);
+  await page.waitForTimeout(300);
+  assert.equal(await errorOverlays(), 0, "Falling back to H.264 shows no error overlay");
+  assert.equal(await page.evaluate(() => localStorage.getItem("hghub_hevc_off")), null, "A network failure keeps HEVC preferred");
+  assert.equal(await cacheThisEpisode(), false, "Offline cache stays H.264 until hevc has played on this device");
+  await page.evaluate(() => localStorage.setItem("hghub_hevc_ok", "1"));
+  assert.equal(await cacheThisEpisode(), true, "Once hevc has played on this device, offline cache uses hevc");
+
+  await page.evaluate(() => localStorage.clear());
+  const started = Date.now();
+  await openHevcFeed("codec");
+  await until(usesMain, "An hevc codec the device cannot decode falls back to H.264");
+  const decodeFallbackMs = Date.now() - started;
+  assert.equal(await page.evaluate(() => localStorage.getItem("hghub_hevc_off")), "1", "A decode failure stops preferring HEVC");
+  await page.waitForTimeout(300);
+  assert.equal(await errorOverlays(), 0, "Decode fallback shows no error overlay");
+  await openHevcFeed("codec");
+  await until(() => playlists.length > 0, "Next play requests a playlist");
+  await page.waitForTimeout(300);
+  assert(playlists.every(u => !u.includes("-hevc")), `After a decode failure this device plays H.264 directly: ${playlists}`);
+  report.metrics.hevc = { network_fallback: networkFallback, decode_fallback_ms: decodeFallbackMs };
+  report.passed.push("HEVC: tried first, falls back to H.264 without an error overlay; decode failure disables it; cache uses hevc only after it played");
+  await page.evaluate(() => localStorage.clear());
 
   assert.deepEqual(errors, [], "No page errors");
   await page.screenshot({ path: join(output, "final.png") });

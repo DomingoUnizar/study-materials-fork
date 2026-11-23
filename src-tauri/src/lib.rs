@@ -54,9 +54,9 @@ pub fn run() {
             tauri::async_runtime::spawn(offline::run_worker(
                 {
                     let handle = handle.clone();
-                    move |vid, ep| {
+                    move |vid, ep, hevc| {
                         let handle = handle.clone();
-                        async move { api::play_url(&handle, vid, ep).await }
+                        async move { api::play_url(&handle, vid, ep, hevc).await }
                     }
                 },
                 |url: String| async move { media::download_bytes(&url).await },

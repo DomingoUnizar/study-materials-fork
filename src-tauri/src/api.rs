@@ -522,13 +522,14 @@ pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, 
 }
 
 /// 离线下载用：取一集当前有效的播放地址（签名有时效，每次下载/续传前重新取）。
-pub async fn play_url(app: &tauri::AppHandle, id: i64, ep: u32) -> Result<String, String> {
+/// `hevc` 为真且上游提供 hevc 流时用它，否则用 main。
+pub async fn play_url(app: &tauri::AppHandle, id: i64, ep: u32, hevc: bool) -> Result<String, String> {
     use tauri::Manager;
     let info = play_info(&app.state::<Api>(), id, ep).await?;
-    info.get("video_url")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+    let pick = |field: &str| info.get(field).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    hevc.then(|| pick("video_url_hevc"))
+        .flatten()
+        .or_else(|| pick("video_url"))
         .ok_or_else(|| "暂无播放地址".to_string())
 }
 
@@ -578,9 +579,10 @@ pub async fn offline_enqueue(
     title: String,
     cover: String,
     detail: Value,
+    hevc: Option<bool>,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    for ep in crate::offline::enqueue(vid, &eps, &title, &detail)? {
+    for ep in crate::offline::enqueue(vid, &eps, &title, &detail, hevc.unwrap_or(false))? {
         let _ = app.emit("offline-progress", &ep);
     }
     if !cover.is_empty() && !crate::offline::has_cover(vid) {

@@ -36,6 +36,9 @@ pub struct Episode {
     pub error: Option<String>,
     /// 加入队列的先后，越小越先下载
     pub seq: u64,
+    /// 下载 hevc 流（前端在本机播放过 hevc 时选用；与 main 同分辨率、体积约一半）
+    #[serde(default)]
+    pub hevc: bool,
 }
 
 struct Offline {
@@ -62,8 +65,8 @@ pub fn list() -> Result<Value, String> {
     Ok(state()?.list())
 }
 
-pub fn enqueue(vid: i64, eps: &[u32], title: &str, detail: &Value) -> Result<Vec<Episode>, String> {
-    state()?.enqueue(vid, eps, title, detail)
+pub fn enqueue(vid: i64, eps: &[u32], title: &str, detail: &Value, hevc: bool) -> Result<Vec<Episode>, String> {
+    state()?.enqueue(vid, eps, title, detail, hevc)
 }
 
 pub fn delete(vid: i64, ep: Option<u32>) -> Result<(), String> {
@@ -92,7 +95,7 @@ pub fn read(rest: &str) -> Option<(&'static str, Vec<u8>)> {
 /// 后台下载循环：队列空或被暂停时等待唤醒，不轮询。
 pub async fn run_worker<P, PF, F, FF, E>(play_url: P, fetch: F, emit: E)
 where
-    P: Fn(i64, u32) -> PF + Send + Sync + 'static,
+    P: Fn(i64, u32, bool) -> PF + Send + Sync + 'static,
     PF: Future<Output = Result<String, String>> + Send,
     F: Fn(String) -> FF + Send + Sync + 'static,
     FF: Future<Output = Result<Arc<Vec<u8>>, String>> + Send,
@@ -147,7 +150,7 @@ impl Offline {
         json!({ "episodes": episodes, "series": series })
     }
 
-    fn enqueue(&self, vid: i64, eps: &[u32], title: &str, detail: &Value) -> Result<Vec<Episode>, String> {
+    fn enqueue(&self, vid: i64, eps: &[u32], title: &str, detail: &Value, hevc: bool) -> Result<Vec<Episode>, String> {
         if vid <= 0 {
             return Err("无效的剧集".into());
         }
@@ -162,9 +165,15 @@ impl Offline {
             if existing.as_ref().is_some_and(|e| e.state != "error") {
                 continue;
             }
-            fs::create_dir_all(self.episode_dir(vid, ep)).map_err(|_| "无法创建缓存目录")?;
+            // 续传按文件名认已下载的部分：重试时换了流（如设备后来不再优先 HEVC）就清掉旧流的文件从头下，两路分片不能混用
+            let resume = existing.filter(|e| e.hevc == hevc);
+            let dir = self.episode_dir(vid, ep);
+            if resume.is_none() && dir.exists() {
+                fs::remove_dir_all(&dir).map_err(|_| "无法清理旧的缓存文件")?;
+            }
+            fs::create_dir_all(&dir).map_err(|_| "无法创建缓存目录")?;
             let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-            let meta = match existing {
+            let meta = match resume {
                 Some(e) => Episode { state: "queued".into(), error: None, seq, ..e },
                 None => Episode {
                     vid,
@@ -176,6 +185,7 @@ impl Offline {
                     bytes: 0,
                     error: None,
                     seq,
+                    hevc,
                 },
             };
             save_meta(&self.root, &meta).map_err(|_| "无法保存缓存状态")?;
@@ -242,7 +252,7 @@ impl Offline {
 
     async fn run<P, PF, F, FF, E>(self: Arc<Self>, play_url: P, fetch: F, emit: E)
     where
-        P: Fn(i64, u32) -> PF,
+        P: Fn(i64, u32, bool) -> PF,
         PF: Future<Output = Result<String, String>>,
         F: Fn(String) -> FF,
         FF: Future<Output = Result<Arc<Vec<u8>>, String>>,
@@ -272,7 +282,7 @@ impl Offline {
 
     async fn download<P, PF, F, FF, E>(&self, mut ep: Episode, play_url: &P, fetch: &F, emit: &E)
     where
-        P: Fn(i64, u32) -> PF,
+        P: Fn(i64, u32, bool) -> PF,
         PF: Future<Output = Result<String, String>>,
         F: Fn(String) -> FF,
         FF: Future<Output = Result<Arc<Vec<u8>>, String>>,
@@ -300,7 +310,7 @@ impl Offline {
 
     async fn fetch_episode<P, PF, F, FF, E>(&self, ep: &mut Episode, play_url: &P, fetch: &F, emit: &E) -> Result<(), String>
     where
-        P: Fn(i64, u32) -> PF,
+        P: Fn(i64, u32, bool) -> PF,
         PF: Future<Output = Result<String, String>>,
         F: Fn(String) -> FF,
         FF: Future<Output = Result<Arc<Vec<u8>>, String>>,
@@ -371,12 +381,12 @@ struct Plan {
 
 async fn load_plan<P, PF, F, FF>(ep: &Episode, play_url: &P, fetch: &F) -> Result<Plan, String>
 where
-    P: Fn(i64, u32) -> PF,
+    P: Fn(i64, u32, bool) -> PF,
     PF: Future<Output = Result<String, String>>,
     F: Fn(String) -> FF,
     FF: Future<Output = Result<Arc<Vec<u8>>, String>>,
 {
-    let mut url = play_url(ep.vid, ep.ep).await?;
+    let mut url = play_url(ep.vid, ep.ep, ep.hevc).await?;
     let mut text = utf8(fetch(url.clone()).await?)?;
     if let Some(variant) = pick_variant(&text, &url) {
         text = utf8(fetch(variant.clone()).await?)?;
@@ -597,9 +607,10 @@ mod tests {
         let expired_once = Arc::new(AtomicBool::new(false));
         let play_url = {
             let plays = plays.clone();
-            move |vid: i64, ep: u32| {
+            move |vid: i64, ep: u32, hevc: bool| {
                 let n = plays.fetch_add(1, Ordering::SeqCst) + 1;
-                async move { Ok(format!("https://cdn.example/{vid}/{ep}/index.m3u8?auth={n}")) }
+                let stream = if hevc { "hevc" } else { "main" };
+                async move { Ok(format!("https://cdn.example/{vid}/{ep}/{stream}/index.m3u8?auth={n}")) }
             }
         };
         let fetch = {
@@ -615,7 +626,7 @@ mod tests {
                         return Ok(Arc::new(MEDIA.as_bytes().to_vec()));
                     }
                     // 第 1 集的第二个分片第一次请求时签名「过期」
-                    if url.contains("/1/seg1.ts") && !expired_once.swap(true, Ordering::SeqCst) {
+                    if url.contains("/1/main/seg1.ts") && !expired_once.swap(true, Ordering::SeqCst) {
                         return Err("HTTP 403 Forbidden".to_string());
                     }
                     Ok(Arc::new(format!("bytes of {}", url.split('?').next().unwrap()).into_bytes()))
@@ -629,20 +640,45 @@ mod tests {
         };
         let worker = tokio::spawn(offline.clone().run(play_url, fetch, emit));
         let detail = json!({"id": 5, "title": "剧", "episodes": [{"ep_num": 1}, {"ep_num": 2}]});
-        assert_eq!(offline.enqueue(5, &[1, 2], "剧", &detail).unwrap().len(), 2);
-        assert!(offline.enqueue(5, &[1, 2], "剧", &detail).unwrap().is_empty(), "no duplicates");
+        assert_eq!(offline.enqueue(5, &[1], "剧", &detail, false).unwrap().len(), 1);
+        assert_eq!(offline.enqueue(5, &[1, 2], "剧", &detail, true).unwrap().len(), 1, "no duplicates");
         let eps = wait_until(&root, |eps| eps.len() == 2 && eps.iter().all(|e| e.state == "done")).await;
         assert!(eps.iter().all(|e| e.total == 3 && e.done == 3 && e.bytes > 0));
         assert_eq!(peak.load(Ordering::SeqCst), 1, "never more than one request at a time");
         assert_eq!(plays.load(Ordering::SeqCst), 3, "one refresh after the expired signature");
         let local = fs::read_to_string(root.join("5").join("1").join("index.m3u8")).unwrap();
         assert!(local.contains("URI=\"k0.key\"") && local.contains("\ns1.ts\n") && !local.contains("https://"));
-        assert_eq!(offline.read("5/1/s2.ts").unwrap().1, b"bytes of https://cdn.example/5/1/seg1.ts".to_vec());
+        assert_eq!(offline.read("5/1/s2.ts").unwrap().1, b"bytes of https://cdn.example/5/1/main/seg1.ts".to_vec());
+        // 每集按加入时选的流下载：第 2 集选了 hevc
+        assert_eq!(offline.read("5/2/s2.ts").unwrap().1, b"bytes of https://cdn.example/5/2/hevc/seg1.ts".to_vec());
+        assert!(read_meta(&root, 5, 2).unwrap().hevc && !read_meta(&root, 5, 1).unwrap().hevc);
         assert_eq!(offline.list()["series"]["5"]["title"], "剧");
         let states: Vec<String> = events.lock().unwrap().iter().filter(|e| e.ep == 1).map(|e| e.state.clone()).collect();
         assert_eq!(states.first().map(String::as_str), Some("downloading"));
         assert_eq!(states.last().map(String::as_str), Some("done"));
         worker.abort();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retrying_with_another_stream_starts_over() {
+        let root = temp_root("switch");
+        let offline = Offline::new(root.clone());
+        let dir = root.join("4").join("1");
+        let failed = Episode { vid: 4, ep: 1, title: "剧".into(), state: "error".into(), done: 1, total: 3, bytes: 4, error: Some("x".into()), seq: 1, hevc: false };
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("s1.ts"), b"main").unwrap();
+        save_meta(&root, &failed).unwrap();
+        // 同一路流重试：保留已下载的文件续传
+        offline.enqueue(4, &[1], "剧", &json!({}), false).unwrap();
+        assert!(dir.join("s1.ts").exists());
+        assert_eq!(read_meta(&root, 4, 1).unwrap().done, 1);
+        // 换成 hevc 重试：main 的残留文件清掉，从头下载
+        save_meta(&root, &failed).unwrap();
+        let queued = offline.enqueue(4, &[1], "剧", &json!({}), true).unwrap();
+        assert!(queued[0].hevc && queued[0].done == 0 && queued[0].state == "queued");
+        assert!(!dir.join("s1.ts").exists());
+        assert!(read_meta(&root, 4, 1).unwrap().hevc);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -665,12 +701,12 @@ mod tests {
             }
         };
         let worker = tokio::spawn(offline.clone().run(
-            |vid: i64, ep: u32| async move { Ok(format!("https://cdn.example/{vid}/{ep}/index.m3u8")) },
+            |vid: i64, ep: u32, _hevc: bool| async move { Ok(format!("https://cdn.example/{vid}/{ep}/index.m3u8")) },
             fetch,
             |_: &Episode| {},
         ));
         offline.set_paused(true);
-        offline.enqueue(9, &[1, 2], "剧", &json!({})).unwrap();
+        offline.enqueue(9, &[1, 2], "剧", &json!({}), false).unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(fetches.load(Ordering::SeqCst), 0, "online playback pauses the queue");
         offline.delete(9, Some(2)).unwrap();
@@ -682,7 +718,7 @@ mod tests {
         assert!(!root.join("9").exists());
         // 重启时，中断的下载回到队列
         fs::create_dir_all(root.join("3").join("1")).unwrap();
-        let stuck = Episode { vid: 3, ep: 1, title: "x".into(), state: "downloading".into(), done: 1, total: 3, bytes: 4, error: None, seq: 7 };
+        let stuck = Episode { vid: 3, ep: 1, title: "x".into(), state: "downloading".into(), done: 1, total: 3, bytes: 4, error: None, seq: 7, hevc: false };
         save_meta(&root, &stuck).unwrap();
         let reopened = Offline::new(root.clone());
         assert_eq!(read_meta(&root, 3, 1).unwrap().state, "queued");

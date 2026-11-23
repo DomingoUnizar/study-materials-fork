@@ -9,6 +9,7 @@ import PlayerControls from "./PlayerControls";
 import PlaybackLock from "./PlaybackLock";
 import { ArticlePanel, CachePanel, CommentsPanel, EpisodesPanel } from "./Panels";
 import { isOffline, isOfflineUrl, offlineSeries, offlineUrl, setStreaming, useOffline } from "../offline";
+import { disableHevc, hevcPlayed, preferHevc } from "../hevc";
 import { setBackHandler } from "../back";
 import {
   IBack, IBoltF, ICheck, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IDownload, IExpand, IFileText, IHeart, IHeartF,
@@ -44,6 +45,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [epMap, setEpMap] = useState<Record<number, number>>(() => (startEp ? { [videoIds[startIndex]]: startEp } : {}));
   const [details, setDetails] = useState<Record<number, Detail>>({});
   const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
+  /* 优先播 HEVC 时记下这一集的两路地址：正在播的 hevc 出错就自动换回 H.264（main） */
+  const [hevcPlays, setHevcPlays] = useState<Record<string, { hevc: string; main: string }>>({});
   const [cards] = useState<Record<number, VideoCard>>({});
   const [posts, setPosts] = useState<Record<number, Post>>({});
 
@@ -406,7 +409,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       .then((info) => {
         if (!alive) return;
         if (!info?.video_url) throw new Error("暂无播放地址");
-        setPlayUrls((m) => ({ ...m, [playKey]: info.video_url }));
+        const hevc = info.video_url_hevc && preferHevc() ? info.video_url_hevc : "";
+        setPlayUrls((m) => ({ ...m, [playKey]: hevc || info.video_url }));
+        if (hevc) setHevcPlays((m) => ({ ...m, [playKey]: { hevc, main: info.video_url } }));
         addHistory(curId, curEp);
       })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
@@ -420,6 +425,19 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setStreaming(streamId.current, active && !paused && !!playUrl && !isOfflineUrl(playUrl));
   }, [active, paused, playUrl]);
   useEffect(() => () => setStreaming(streamId.current, false), []);
+
+  /* HEVC 播放出错时自动换回同一集的 H.264，从原位置接着播；解码错误说明设备其实不支持，之后不再优先 HEVC */
+  const onPlayError = (message: string) => {
+    const alt = hevcPlays[playKey];
+    if (alt && playUrl === alt.hevc) {
+      if (message.startsWith("mediaError")) disableHevc();
+      const t = videoRef.current?.el()?.currentTime || time;
+      if (t > 1) resumeRef.current = { key: playKey, t };
+      setPlayUrls((m) => ({ ...m, [playKey]: alt.main }));
+      return;
+    }
+    setErr(message);
+  };
 
   /* 播放地址带时效签名（auth_key），停留或暂停过久会过期：手动「重新加载」时换取新地址，并从当前位置续播 */
   const reloadWithFreshUrl = () => {
@@ -882,11 +900,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       onTime={onTimeTick}
                       onDuration={onDurationTick}
                       onSize={(w, h) => setVsize({ w, h })}
-                      onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); }}
+                      onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); if (playUrl === hevcPlays[playKey]?.hevc) hevcPlayed(); }}
                       onPause={() => setPaused(true)}
                       onWaiting={() => setWaiting(true)}
                       onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
-                      onError={(m) => setErr(m)}
+                      onError={onPlayError}
                     />
                   </div>
 
