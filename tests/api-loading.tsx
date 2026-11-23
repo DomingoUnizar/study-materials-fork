@@ -6,7 +6,9 @@ import { AppProvider, useStore } from "../src/store";
 import "../src/index.css";
 
 type Request = { cmd: string; args: Record<string, unknown>; resolve: (value: unknown) => void; reject: (error: string) => void };
-const signedPlayUrls = new URLSearchParams(location.search).get("play") === "signed";
+const params = new URLSearchParams(location.search);
+const signedPlayUrls = params.get("play") === "signed";
+const withEpisodes = params.get("detail") === "episodes";
 const pending: Request[] = [];
 const fixture = {
   history: [] as { cmd: string; args: Record<string, unknown> }[],
@@ -43,6 +45,12 @@ Object.assign(window, {
     // Feed detail/play requests fail like an unavailable upstream; record them to count re-requests.
     if (cmd === "api_video" || cmd === "api_play") {
       fixture.feedCalls.push({ cmd, args });
+      if (cmd === "api_video" && withEpisodes) {
+        return Promise.resolve({
+          id: args.id, title: "测试短剧", description: "", cover: "", tags: [], score: 0, episode_count: 4, total_episodes: 4,
+          episodes: [1, 2, 3, 4].map(ep_num => ({ ep_num, title: `第${ep_num}集`, duration: 60, status: 1 })),
+        });
+      }
       if (cmd === "api_play" && signedPlayUrls) {
         // Every play request returns a freshly signed address, as the upstream does.
         const n = fixture.feedCalls.filter(r => r.cmd === "api_play").length;
@@ -70,7 +78,7 @@ function Fixture() {
   const home = new URLSearchParams(location.search).get("page") === "home";
   return <AppProvider>
     <StoreProbe />
-    <div style={{ position: "relative", width: 900, height: 1000 }}>
+    <div style={params.get("layout") === "mobile" ? { position: "fixed", inset: 0 } : { position: "relative", width: 900, height: 1000 }}>
       {home ? <Home active bottomInset={0} /> : <Category wide active={active} />}
     </div>
   </AppProvider>;

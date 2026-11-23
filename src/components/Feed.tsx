@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { api, cover, fmt, fmtTime, isMobile } from "../api";
 import type { Detail, Episode, Post, VideoCard } from "../types";
@@ -13,6 +13,9 @@ import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
   ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
 } from "../icons";
+
+/* 竖屏进度条（连同上方的标题、详情区）离屏幕底部至少 56px，避开安卓全面屏手势区 */
+const MOBILE_BAR_BOTTOM = 56;
 
 type Props = {
   videoIds: number[];
@@ -108,8 +111,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [lockArmed, setLockArmed] = useState(false);
   const holdRef = useRef(false);
   const lockArmedRef = useRef(false);
-  const [scrub, setScrub] = useState<{ pct: number; target: number } | null>(null);
-  const scrubTarget = useRef<number | null>(null);
   /* 竖屏下横屏视频适应模式 + 双指无级缩放/平移 */
   const [portraitFit, setPortraitFit] = useState<"contain" | "cover">("contain");
   const [zoom, setZoom] = useState({ scale: 1, x: 0, y: 0, gesturing: false });
@@ -121,7 +122,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [barPct, setBarPct] = useState<number | null>(null);
   const gesture = useRef<{
     x: number; y: number; startX: number; startY: number; t: number; timer: number | null;
-    mode: "idle" | "hold" | "scrub" | "pan"; base: number; width: number; playing: boolean;
+    mode: "idle" | "hold" | "swipe" | "pan";
   } | null>(null);
 
   const curId = videoIds[index];
@@ -131,12 +132,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const playUrl = playUrls[playKey] || "";
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
+  /* 剧集模式（移动端）：右划进入当前这部剧，竖向列表换成本剧各集；左划回到原列表，该剧停在刚看的那一集 */
+  const [seriesMode, setSeriesMode] = useState(false);
+  const inSeries = seriesMode && kind === "video" && episodes.length > 0;
+  const listKeys: (number | string)[] = inSeries ? episodes.map((e) => `ep-${e.ep_num}`) : videoIds;
+  const listLength = listKeys.length;
+  const listIndex = inSeries ? Math.max(0, episodes.findIndex((e) => e.ep_num === curEp)) : index;
   const post = posts[curId];
 
   /* 观看进度：onTime 里每 5 秒落一次；拖动进度条期间忽略底层 timeupdate 防止进度条回跳 */
   const onTimeTick = (t: number) => {
     liveRef.current = { id: curId, ep: curEp, dur: duration, t };
-    if (!barScrub.current && gesture.current?.mode !== "scrub") {
+    if (!barScrub.current) {
       setTime(t);
     }
     const now = Date.now();
@@ -294,7 +301,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     const syncScroll = () => {
       const box = boxRef.current;
       if (!box || fs) return;
-      box.scrollTop = index * (box.clientHeight || 1);
+      box.scrollTop = listIndex * (box.clientHeight || 1);
     };
     syncScroll();
     const raf = requestAnimationFrame(syncScroll);
@@ -305,7 +312,14 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
-  }, [fs, vpLandscape, index]);
+  }, [fs, vpLandscape, listIndex, inSeries]);
+
+  /* 进出剧集模式时立即对齐滚动位置，避免沿用旧列表的 scrollTop 选错集数 */
+  useLayoutEffect(() => {
+    const el = boxRef.current;
+    if (el && !fs) el.scrollTop = listIndex * (el.clientHeight || 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inSeries]);
 
   /* 滚动定位（全屏或缩放手势期间锁定索引，避免容器尺寸变化误触发翻页） */
   const onScroll = useCallback(() => {
@@ -313,10 +327,15 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     const el = boxRef.current;
     if (!el) return;
     const h = el.clientHeight || 1;
-    const i = Math.max(0, Math.min(videoIds.length - 1, Math.round(el.scrollTop / h)));
+    const i = Math.max(0, Math.min(listLength - 1, Math.round(el.scrollTop / h)));
+    if (inSeries) {
+      const ep = episodes[i]?.ep_num;
+      if (ep && ep !== curEp) setEpMap((m) => ({ ...m, [curId]: ep }));
+      return;
+    }
     setIndex((prev) => (prev === i ? prev : i));
     if (onNearEnd && i >= videoIds.length - 3) onNearEnd();
-  }, [videoIds.length, onNearEnd, fs]);
+  }, [videoIds.length, onNearEnd, fs, inSeries, listLength, episodes, curEp, curId]);
 
   const go = useCallback((delta: number) => {
     const el = boxRef.current;
@@ -405,7 +424,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (!fs && boxRef.current) {
       const el = boxRef.current;
       requestAnimationFrame(() => {
-        el.scrollTop = index * (el.clientHeight || 1);
+        el.scrollTop = listIndex * (el.clientHeight || 1);
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -485,8 +504,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     }
     lockArmedRef.current = false;
     setLockArmed(false);
-    setScrub(null);
-    scrubTarget.current = null;
   };
 
   const onTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
@@ -543,17 +560,24 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     }
   };
 
-  /* —— 长按 2x（上滑锁定） / 横拖定位 / 单击清屏 / 双击暂停 —— */
+  /* 剧集模式切换：列表换成本剧各集（或换回）后当前播放器会重建，记下进度接着播 */
+  const switchSeries = (on: boolean) => {
+    if (on && !episodes.length) { toast("选集还没加载好，稍后再试", "info"); return; }
+    const t = videoRef.current?.el()?.currentTime || time;
+    if (t > 1) resumeRef.current = { key: playKey, t };
+    setSeriesMode(on);
+    toast(on ? "剧集模式：上下滑切换集数，左划返回" : "已返回列表", "info");
+  };
+
+  /* —— 长按 2x（上滑锁定） / 左右划进出剧集模式 / 单击清屏 / 双击暂停 —— */
   const onDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isDesktop || controlsLocked || !active || !e.isPrimary || pinchRef.current || gesture.current || e.button !== 0) return;
     const el = e.currentTarget;
-    const span = rotated ? (el.clientHeight || window.innerHeight || 1) : (el.clientWidth || 1);
     try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     const g = {
       x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY,
-      t: Date.now(), base: time, width: span,
-      playing: videoRef.current?.el()?.paused === false,
-      mode: "idle" as "idle" | "hold" | "scrub" | "pan",
+      t: Date.now(),
+      mode: "idle" as "idle" | "hold" | "swipe" | "pan",
       timer: window.setTimeout(() => {
         const cur = gesture.current;
         if (!cur || cur.mode !== "idle" || pinchRef.current) return;
@@ -596,21 +620,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       if (Math.abs(dx) > 16 && Math.abs(dx) > Math.abs(dy) * 1.2) {
         clearTapTimer();
         if (g.timer) window.clearTimeout(g.timer);
-        g.mode = "scrub";
+        g.mode = "swipe";
       } else if (Math.abs(dy) > 16) {
         clearTapTimer();
         if (g.timer) window.clearTimeout(g.timer);
         g.mode = "pan";
       }
-      return;
-    }
-
-    if (g.mode === "scrub") {
-      const total = duration || 0;
-      if (!total) return;
-      const target = Math.max(0, Math.min(total - 0.2, g.base + (dx / g.width) * total));
-      scrubTarget.current = target;
-      setScrub({ pct: (target / total) * 100, target });
     }
   };
 
@@ -632,16 +647,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       setLockArmed(false);
       return;
     }
-    if (g.mode === "scrub") {
-      const target = scrubTarget.current;
-      setScrub(null);
-      scrubTarget.current = null;
-      if (!cancelled && target != null) {
-        setErr("");
-        setTime(target);
-        videoRef.current?.seek(target, "mobile_gesture");
+    if (g.mode === "swipe") {
+      // 画面左右划只用来进出剧集模式（全屏下不切换）；定位只用进度条
+      const dx = e ? e.clientX - g.startX : 0;
+      if (!cancelled && !fs && Math.abs(dx) >= 60) {
+        if (dx > 0 && !inSeries) switchSeries(true);
+        else if (dx < 0 && inSeries) switchSeries(false);
       }
-      if (g.playing && active) videoRef.current?.play();
       return;
     }
 
@@ -807,11 +819,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       <div ref={boxRef} onScroll={onScroll}
         className={`absolute inset-y-0 left-0 no-bar ${fs ? "overflow-hidden" : "overflow-y-scroll snap-y snap-mandatory overscroll-y-contain"}`}
         style={{ right: isDesktop && panel ? 372 : 0, transition: "right .3s cubic-bezier(.2,0,0,1)" }}>
-        {videoIds.map((vid, i) => {
-          const isActive = i === index;
+        {listKeys.map((key, i) => {
+          const vid = inSeries ? curId : (key as number);
+          const isActive = i === listIndex;
           return (
             <section
-              key={vid}
+              key={key}
               style={!isActive && fs ? { display: "none" } : undefined}
               className={`relative w-full h-full snap-start snap-always ${fs && isActive ? "" : "overflow-hidden"}`}>
               {isActive && playUrl ? (
@@ -854,17 +867,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       onError={(m) => setErr(m)}
                     />
                   </div>
-
-                  {/* 横拖定位浮层 */}
-                  {!isDesktop && scrub && (
-                    <div className="absolute inset-0 z-30 flex flex-col items-center justify-center pointer-events-none" style={{ background: "rgba(0,0,0,.25)" }}>
-                      <span className="text-[26px] font-bold hg-ink tabular-nums hg-ov-shadow">{fmtTime(scrub.target)}</span>
-                      <span className="text-[11px] hg-ink-4 mt-1 tabular-nums">/ {fmtTime(duration)}</span>
-                      <div className="mt-4 w-[62%] h-[3px] rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,.25)" }}>
-                        <div className="h-full bg-white" style={{ width: `${scrub.pct}%` }} />
-                      </div>
-                    </div>
-                  )}
 
                   {/* 暂停 / 缓冲 / 报错恢复 */}
                   {paused && !err && (
@@ -918,6 +920,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     <>
                       <div className="absolute right-4 z-40 flex items-center gap-2"
                         style={{ top: rotated || vpLandscape ? 14 : "calc(var(--sat, 0px) + 8px)" }}>
+                        <button onClick={() => setMuted((m) => !m)} aria-label={muted ? "取消静音" : "静音"}
+                          className="hg-chip-strong w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1">
+                          {muted ? <IVolMute size={17} /> : <IVol size={17} />}
+                        </button>
                         <button onClick={lockControls} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false}
                           className="hg-chip-strong w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1">
                           <ILockF size={17} />
@@ -935,10 +941,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           还原画面 ({zoom.scale.toFixed(1)}x)
                         </button>
                       )}
-                      <div className="absolute inset-x-0 z-30 px-4" style={{ bottom: rotated || vpLandscape ? 46 : "calc(var(--sab, 0px) + 52px)", height: 26 }}>
-                        <div className="relative h-full" style={{ touchAction: "none" }}
+                      <div className="absolute inset-x-0 z-30 px-4" style={{ bottom: rotated || vpLandscape ? 40 : "calc(var(--sab, 0px) + 46px)", height: 38 }}>
+                        <div className="relative h-full" role="slider" aria-label="播放进度" style={{ touchAction: "none" }}
                           onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
-                          <div className={`absolute inset-x-0 bottom-[10px] rounded-full transition-all ${barPct !== null ? "h-[5px]" : "h-[3px]"}`}
+                          <div className={`absolute inset-x-0 bottom-[16px] rounded-full transition-all ${barPct !== null ? "h-[5px]" : "h-[3px]"}`}
                             style={{ background: "rgba(255,255,255,.3)" }}>
                             <div className="h-full rounded-full bg-white" style={{ width: `${barProgress * 100}%` }} />
                           </div>
@@ -966,6 +972,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           className={`ml-auto shrink-0 flex items-center gap-1 px-2.5 h-8 rounded-full text-[12px] font-bold pressable ${effRate !== 1 ? "bg-primary text-on-primary" : "hg-chip hg-ink-2"}`}>
                           <IBoltF size={12} />{effRate}x
                         </button>
+                        {kind === "video" && episodes.length > 0 && (
+                          <button onClick={() => setPanel("episodes")} aria-label="选集"
+                            className="shrink-0 flex items-center gap-1 px-2.5 h-8 rounded-full text-[12px] font-bold hg-chip hg-ink-2 pressable">
+                            <IList size={13} />选集
+                          </button>
+                        )}
                         <span className="shrink-0 text-[11.5px] hg-ink-4 tabular-nums">{fmtTime(duration)}</span>
                       </div>
                     </>
@@ -973,7 +985,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                 </div>
               ) : (
                 <div className="absolute inset-0">
-                  <Img src={cards[vid]?.cover || posts[vid]?.cover || details[vid]?.cover || (isActive ? detail?.cover : "") || ""} eager={Math.abs(i - index) <= 1} />
+                  <Img src={cards[vid]?.cover || posts[vid]?.cover || details[vid]?.cover || (isActive ? detail?.cover : "") || ""} eager={Math.abs(i - listIndex) <= 1} />
                   <div className="absolute inset-0" style={{ background: "rgba(0,0,0,.25)" }} />
                 </div>
               )}
@@ -1058,13 +1070,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   <div className="desktop-context-header">
                     <button onClick={onBack} aria-label="返回"><IBack size={17} /></button>
                     <span>{title}</span>
-                    <small>{index + 1} / {videoIds.length}</small>
+                    <small>{listIndex + 1} / {listLength}</small>
                   </div>
                 ) : (
                   <div className="absolute inset-x-0 z-20 flex items-center gap-2 px-2.5" style={{ top: "calc(var(--sat, 0px) + 8px)", paddingRight: 148 }}>
                     <button onClick={onBack} aria-label="返回" className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><IBack size={20} /></button>
                     <span className="text-[14.5px] font-semibold hg-ink hg-ov-shadow truncate">{title}</span>
-                    <span className="ml-auto px-2 py-0.5 rounded-full hg-chip text-[11px] font-semibold" style={{ color: "rgba(255,255,255,.9)" }}>{index + 1} / {videoIds.length}</span>
+                    <span className="ml-auto px-2 py-0.5 rounded-full hg-chip text-[11px] font-semibold" style={{ color: "rgba(255,255,255,.9)" }}>{listIndex + 1} / {listLength}</span>
                   </div>
                 )
               ) : null}
@@ -1073,7 +1085,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   颜色写死不跟主题走：浅色主题下这些字必须仍是白色 */}
               {!fs && !clean && !isDesktop && (
                 <div className="absolute right-3 z-20 flex flex-col items-center gap-[16px]"
-                  style={{ bottom: `calc(var(--sab, 0px) + ${bottomInset + 92}px)` }}>
+                  style={{ bottom: `calc(max(calc(var(--sab, 0px) + ${bottomInset}px), ${MOBILE_BAR_BOTTOM}px) + 92px)` }}>
                   <button onClick={onFav} className="flex flex-col items-center gap-1 pressable" aria-pressed={isFav(curId)} aria-label="收藏">
                     {isFav(curId) ? <IStarF size={27} className="hg-gold" /> : <IStar size={27} className="hg-ink hg-ov-shadow" />}
                     <span className="text-[10.5px] hg-ink-2 hg-ov-shadow">收藏</span>
@@ -1169,7 +1181,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
               {/* 移动端：标题 + 详情标签 + 进度线（清屏 clean 模式下隐藏） */}
               {!fs && !clean && !isDesktop && (
-                <div className="absolute inset-x-0 z-20" style={{ bottom: `calc(var(--sab, 0px) + ${bottomInset}px)` }}>
+                <div className="absolute inset-x-0 z-20" style={{ bottom: `max(calc(var(--sab, 0px) + ${bottomInset}px), ${MOBILE_BAR_BOTTOM}px)` }}>
                   <div className="absolute inset-x-0 bottom-0 h-[190px] pointer-events-none"
                     style={{ background: "linear-gradient(0deg, rgba(0,0,0,.82) 0%, rgba(0,0,0,.42) 45%, transparent 100%)" }} />
                   <p className="relative px-4 pb-2 text-[14px] font-semibold leading-snug hg-ink hg-ov-shadow clamp-2">{meta.title}</p>
@@ -1179,7 +1191,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       详情 · 第 {curEp} 集<IChevR size={11} />
                     </button>
                     {isActive && (
-                      <div className="mx-4 mt-1.5 relative" style={{ height: 22, touchAction: "none" }}
+                      // 触控区上下各扩 8px（22px → 38px），进度线位置与布局高度不变
+                      <div className="mx-4 relative" role="slider" aria-label="播放进度"
+                        aria-valuemin={0} aria-valuemax={Math.round(duration)} aria-valuenow={Math.round(barPct !== null ? barPct * duration : time)}
+                        style={{ height: 38, marginTop: -2, marginBottom: -8, touchAction: "none" }}
                         onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
                         <div className={`absolute inset-x-0 top-1/2 -translate-y-1/2 rounded-full transition-all ${barPct !== null ? "h-[5px]" : "h-[2.5px]"}`}
                           style={{ background: "rgba(255,255,255,.3)" }}>
@@ -1256,7 +1271,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
             </div>
           </Sheet>
 
-          <Sheet open={panel === "detail" || panel === "episodes"} onClose={() => setPanel(null)}>
+          {/* z-50：全屏层的 z-index 是 45，全屏里点「选集」也要显示在它上面 */}
+          <Sheet z="z-50" open={panel === "detail" || panel === "episodes"} onClose={() => setPanel(null)}>
             <div className="flex flex-col" style={{ height: "72vh" }}>
               {/* 双栏抽屉：详情 / 选集 */}
               <div className="shrink-0 flex items-center gap-2 px-4 pb-2">
