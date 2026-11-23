@@ -177,7 +177,8 @@ pub async fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> 
         .map_err(|e| e.to_string())
 }
 
-/// 切换移动端屏幕方向（iOS 原生旋转屏幕方向：横屏 Landscape / 竖屏 Portrait）。
+/// 切换移动端屏幕方向（横屏 Landscape / 竖屏 Portrait）：iOS 走下方的原生旋转，
+/// Android 走 src-tauri/android/OrientationPlugin.kt。
 #[tauri::command]
 pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(), String> {
     #[cfg(target_os = "ios")]
@@ -186,12 +187,28 @@ pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(
             request_ios_orientation(landscape);
         });
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let plugin = app
+            .try_state::<OrientationPlugin>()
+            .ok_or("屏幕方向插件未加载")?;
+        plugin
+            .0
+            .run_mobile_plugin_async::<()>("setOrientation", json!({ "landscape": landscape }))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         let _ = (&app, landscape);
     }
     Ok(())
 }
+
+/// 安卓屏幕方向插件句柄，由 lib.rs 注册插件时放入应用状态。
+#[cfg(target_os = "android")]
+pub struct OrientationPlugin(pub tauri::plugin::PluginHandle<tauri::Wry>);
 
 #[cfg(target_os = "ios")]
 fn request_ios_orientation(landscape: bool) {

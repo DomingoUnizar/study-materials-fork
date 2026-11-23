@@ -21,6 +21,22 @@ pub fn run() {
                 .open_js_links_on_click(false)
                 .build(),
         )
+        .plugin(
+            // 安卓全屏横屏：注册 src-tauri/android/OrientationPlugin.kt
+            // （构建前由 scripts/sync-android-native.mjs 复制进生成的工程）。
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("orientation")
+                .setup(|app, plugin| {
+                    #[cfg(target_os = "android")]
+                    {
+                        let handle = plugin.register_android_plugin("com.hghub.huangguo", "OrientationPlugin")?;
+                        app.manage(api::OrientationPlugin(handle));
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    let _ = (app, plugin);
+                    Ok(())
+                })
+                .build(),
+        )
         .manage(Api::new())
         .setup(|app| {
             if let Ok(dir) = app.path().app_data_dir() {
