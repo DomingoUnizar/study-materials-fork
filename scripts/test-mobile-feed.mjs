@@ -70,15 +70,18 @@ try {
   report.passed.push("Portrait progress bar: 38px touch area, at least 56px above the bottom gesture area");
 
   assert.equal(await sections(), 1);
-  await swipe(100, 300);
+  await swipe(100, 300); // left to right only returns from episode mode
+  await page.waitForTimeout(300);
+  assert.equal(await sections(), 1, "A left-to-right swipe outside episode mode does nothing");
+  await swipe(300, 100);
   await page.waitForFunction(() => document.querySelectorAll("section").length === 4);
   await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
   await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 2));
-  await swipe(300, 100);
+  await swipe(100, 300);
   await page.waitForFunction(() => document.querySelectorAll("section").length === 1);
   await page.getByText(/详情 · 第 2 集/).waitFor({ state: "visible" });
   report.metrics.episode_mode = { plays_requested: await plays() };
-  report.passed.push("Swipe right lists the series' episodes, vertical swipe plays episode 2, swipe left returns and keeps episode 2");
+  report.passed.push("Right-to-left swipe lists the series' episodes (left-to-right does not), vertical swipe plays episode 2, left-to-right swipe returns and keeps episode 2");
 
   await page.getByRole("button", { name: "全屏", exact: true }).click();
   const unmute = page.getByRole("button", { name: "取消静音", exact: true });
@@ -123,7 +126,7 @@ try {
   const enqueued = (await offlineCalls()).find(c => c.cmd === "offline_enqueue").args;
   assert.deepEqual([enqueued.vid, enqueued.eps], [991, [3, 4]], "Only episodes neither cached nor downloading are queued");
   await cacheRest.waitFor({ state: "detached" }); // the closing sheet's backdrop would swallow the swipe
-  await swipe(100, 300);
+  await swipe(300, 100);
   await page.waitForFunction(() => document.querySelectorAll("section").length === 4);
   await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
   await until(async () => (await plays()).includes(2), "Uncached episode 2 requests a play address");

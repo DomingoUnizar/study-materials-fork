@@ -138,7 +138,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const cachedHere = kind === "video" && isOffline(curId, curEp);
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
-  /* 剧集模式（移动端）：右划进入当前这部剧，竖向列表换成本剧各集；左划回到原列表，该剧停在刚看的那一集 */
+  /* 剧集模式（移动端）：从右往左划进入当前这部剧，竖向列表换成本剧各集；从左往右划回到原列表，该剧停在刚看的那一集 */
   const [seriesMode, setSeriesMode] = useState(false);
   const inSeries = seriesMode && kind === "video" && episodes.length > 0;
   const listKeys: (number | string)[] = inSeries ? episodes.map((e) => `ep-${e.ep_num}`) : videoIds;
@@ -605,7 +605,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     const t = videoRef.current?.el()?.currentTime || time;
     if (t > 1) resumeRef.current = { key: playKey, t };
     setSeriesMode(on);
-    toast(on ? "剧集模式：上下滑切换集数，左划返回" : "已返回列表", "info");
+    toast(on ? "剧集模式：上下滑切换集数，从左往右滑返回" : "已返回列表", "info");
   };
 
   /* —— 长按 2x（上滑锁定） / 左右划进出剧集模式 / 单击清屏 / 双击暂停 —— */
@@ -687,11 +687,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       return;
     }
     if (g.mode === "swipe") {
-      // 画面左右划只用来进出剧集模式（全屏下不切换）；定位只用进度条
+      // 画面左右划只用来进出剧集模式：从右往左（dx < 0）进入、从左往右返回，全屏下不切换；定位只用进度条
       const dx = e ? e.clientX - g.startX : 0;
       if (!cancelled && !fs && Math.abs(dx) >= 60) {
-        if (dx > 0 && !inSeries) switchSeries(true);
-        else if (dx < 0 && inSeries) switchSeries(false);
+        if (dx < 0 && !inSeries) switchSeries(true);
+        else if (dx > 0 && inSeries) switchSeries(false);
       }
       return;
     }
