@@ -5,6 +5,7 @@ import Category, { ChannelPage } from "../src/pages/Category";
 import Profile from "../src/pages/Profile";
 import { initOffline } from "../src/offline";
 import { AppProvider, useStore } from "../src/store";
+import { ToastHost } from "../src/components/ui";
 import "../src/index.css";
 
 type Request = { cmd: string; args: Record<string, unknown>; resolve: (value: unknown) => void; reject: (error: string) => void };
@@ -30,7 +31,7 @@ const fixture = {
   ready: false,
   setActive: (_active: boolean) => {},
   saveProgress: (_t: number) => {},
-  complete(cmd: string, key: string, result: "404" | "503" | "empty" | "item") {
+  complete(cmd: string, key: string, result: "404" | "503" | "empty" | "item" | "mixed") {
     const index = pending.findIndex(r => r.cmd === cmd && (!key || r.args.cate === key));
     if (index < 0) throw new Error(`No pending request: ${cmd}/${key}`);
     const request = pending.splice(index, 1)[0];
@@ -38,14 +39,16 @@ const fixture = {
       request.reject(`HTTP ${result} Gateway: <html><h1>nginx error</h1></html>`);
       return;
     }
-    request.resolve({
-      items: result === "empty" ? [] : [{
-        id: 991, title: `已加载${key || cmd}`, cover: "", tags: [], score: 0, hot: 0,
-        episode_count: 1, total_episodes: 1, is_finished: true, is_original: 0,
-        like_count: 0, comment_count: 0, collect_count: 0,
-      }],
-      pagination: { page: 1, pages: 1, size: 8, total: result === "empty" ? 0 : 1 },
+    const card = (id: number, title: string, tags: string[]) => ({
+      id, title, cover: "", tags, score: 0, hot: 0, episode_count: 1, total_episodes: 1, is_finished: true, is_original: 0,
+      like_count: 0, comment_count: 0, collect_count: 0,
     });
+    // "mixed": four series plus one tagged 男同 (hidden by the default tag filter) in second place
+    const items = result === "empty" ? [] : result === "mixed"
+      ? [card(991, `已加载${key || cmd}`, []), card(992, "男同题材", ["都市", "男同"]), card(993, "另一部", ["校园"]),
+        card(994, "第三部", ["古风"]), card(995, "第四部", ["职场"])]
+      : [card(991, `已加载${key || cmd}`, [])];
+    request.resolve({ items, pagination: { page: 1, pages: 1, size: 8, total: items.length } });
   },
 };
 
@@ -98,6 +101,7 @@ function Fixture() {
   const page = params.get("page");
   return <AppProvider>
     <StoreProbe />
+    {params.get("toasts") === "1" && <ToastHost />}
     <div style={params.get("layout") === "mobile" ? { position: "fixed", inset: 0 } : { position: "relative", width: 900, height: 1000 }}>
       {page === "home" ? <Home active bottomInset={0} /> : page === "profile" ? <Profile wide={false} />
         : page === "channel" ? <ChannelPage cate="ai-duanju" name="AI成人短剧" onBack={() => {}} wide />

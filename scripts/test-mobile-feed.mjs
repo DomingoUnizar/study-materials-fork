@@ -67,7 +67,22 @@ try {
   report.metrics.progress_bar = { touch_height_px: Math.round(box.height), bottom_gap_px: Math.round(gap) };
   assert(box.height >= 38, `Progress bar touch area is ${box.height}px`);
   assert(gap >= 56, `Progress bar touch area ends ${gap}px above the screen bottom`);
-  report.passed.push("Portrait progress bar: 38px touch area, at least 56px above the bottom gesture area");
+  // The bottom shade must reach the screen edge: anchored to the raised block it left a lighter band under the bar.
+  const greyVideo = await page.addStyleTag({ content: "section video{visibility:hidden!important} section .bg-black{background:#c8c8c8!important}" });
+  const strip = await page.screenshot({ clip: { x: 8, y: viewport.height - 150, width: 1, height: 150 } });
+  await greyVideo.evaluate(el => el.remove());
+  const decoder = await context.newPage();
+  const shadeStep = await decoder.evaluate(async b64 => {
+    const img = new Image(); img.src = `data:image/png;base64,${b64}`; await img.decode();
+    const ctx = Object.assign(document.createElement("canvas"), { width: img.width, height: img.height }).getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    const level = Array.from({ length: img.height }, (_, y) => ctx.getImageData(0, y, 1, 1).data[1]);
+    return Math.max(...level.slice(1).map((v, y) => Math.abs(v - level[y])));
+  }, strip.toString("base64"));
+  await decoder.close();
+  report.metrics.progress_bar.bottom_shade_max_step = shadeStep;
+  assert(shadeStep <= 8, `The bottom shade jumps ${shadeStep} levels below the progress bar`);
+  report.passed.push("Portrait progress bar: 38px touch area, at least 56px above the bottom gesture area, bottom shade without a band");
 
   assert.equal(await sections(), 1);
   await swipe(100, 300); // left to right only returns from episode mode
@@ -83,11 +98,40 @@ try {
   report.metrics.episode_mode = { plays_requested: await plays() };
   report.passed.push("Right-to-left swipe lists the series' episodes (left-to-right does not), vertical swipe plays episode 2, left-to-right swipe returns and keeps episode 2");
 
+  // Long press plays 2x; sliding up locks it; another long press sliding down goes back to 1x.
+  const rateNow = () => page.evaluate(() => document.querySelector("section video")?.playbackRate);
+  const longPressSlide = async dy => {
+    await page.mouse.move(206, 450);
+    await page.mouse.down();
+    await page.waitForTimeout(500);
+    for (let s = 1; s <= 6; s++) await page.mouse.move(206, 450 + (dy * s) / 6);
+    await page.mouse.up();
+  };
+  await longPressSlide(-120);
+  await page.getByText(/已锁定 · 点按解除/).waitFor({ state: "visible" });
+  assert.equal(await rateNow(), 2, "Long press + slide up locks 2x");
+  await longPressSlide(120);
+  await page.getByText(/已锁定 · 点按解除/).waitFor({ state: "detached" });
+  assert.equal(await rateNow(), 1, "Long press + slide down returns to 1x");
+  report.passed.push("Speed: long press + slide up locks 2x; long press + slide down returns to 1x");
+
   await page.getByRole("button", { name: "全屏", exact: true }).click();
   const unmute = page.getByRole("button", { name: "取消静音", exact: true });
   await unmute.waitFor({ state: "visible" });
+  // Muting is real until sound has been on once. After that it keeps the audio output open at an inaudible volume:
+  // closing and reopening the output freezes the picture and pops on Android WebView.
+  const audio = () => page.evaluate(() => { const v = document.querySelector("section video"); return { muted: v.muted, volume: v.volume }; });
+  assert.equal((await audio()).muted, true, "Before sound has been on, muting is real");
   await unmute.click();
   await page.getByRole("button", { name: "静音", exact: true }).waitFor({ state: "visible" });
+  assert.deepEqual(await audio(), { muted: false, volume: 0.7 }, "Sound on at the stored volume");
+  await page.getByRole("button", { name: "静音", exact: true }).click();
+  await unmute.waitFor({ state: "visible" });
+  const silent = await audio();
+  assert(!silent.muted && silent.volume < 0.001, `Muting after sound was on keeps the output open: ${JSON.stringify(silent)}`);
+  await unmute.click();
+  await page.getByRole("button", { name: "静音", exact: true }).waitFor({ state: "visible" });
+  assert.deepEqual(await audio(), { muted: false, volume: 0.7 }, "Unmuting restores the volume");
   await page.locator('button[aria-label="选集"]').click();
   const ep3 = page.getByRole("button", { name: "3", exact: true });
   await ep3.waitFor({ state: "visible" });
@@ -102,7 +146,33 @@ try {
   assert(onTop, "Episode sheet must render above the fullscreen layer");
   await ep3.click();
   await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 3));
-  report.passed.push("Fullscreen: mute toggles; episodes button opens the sheet above the fullscreen layer and switches episodes");
+  // Next to the current time in the fullscreen bar: play the following episode; disabled on the last one.
+  const next = page.locator('button[aria-label="下一集"]');
+  await next.click();
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 4));
+  await page.waitForFunction(() => document.querySelector('button[aria-label="下一集"]')?.disabled === true);
+  report.passed.push("Fullscreen: mute toggles (after sound was on, muting keeps the output open); episodes button opens the sheet above the fullscreen layer and switches episodes; next-episode button plays episode 4, then is disabled on the last episode");
+
+  // Episode mode on the last episode: sliding on towards a next episode says there is none.
+  await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile&toasts=1`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await page.evaluate(() => window.apiLoadingFixture.complete("api_feed", "", "item"));
+  await page.locator("section video").waitFor({ state: "attached" });
+  // Episode mode needs the series' episodes; until they arrive the swipe only says they are still loading.
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_video"));
+  for (let i = 0; i < 5 && (await sections()) !== 4; i++) {
+    await swipe(300, 100);
+    await page.waitForTimeout(400);
+  }
+  assert.equal(await sections(), 4, "Episode mode lists the 4 episodes");
+  await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight * 3; });
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 4));
+  await page.mouse.move(206, 600);
+  await page.mouse.down();
+  for (let s = 1; s <= 8; s++) await page.mouse.move(206, 600 - s * 25);
+  await page.mouse.up();
+  await page.getByText("没有下一集啦", { exact: true }).waitFor({ state: "visible" });
+  report.passed.push("Episode mode: sliding on from the last episode says there is no next episode");
 
   // Offline cache: a cached episode plays from local files; online playback pauses downloads; the
   // cache sheet queues only episodes that are neither cached nor downloading.
@@ -163,6 +233,26 @@ try {
   await page.getByText("还没有离线缓存", { exact: true }).waitFor({ state: "visible" });
   report.passed.push("Profile: offline tab lists the cached series with progress; delete needs a second tap");
 
+  // Favourite updates: a check compares every favourite's episode count with the last one seen (the fixture
+  // detail has 4 episodes). Updated favourites move to the front with a badge and a count on the tab; checks are
+  // at least 6 hours apart; seeing the series clears its badge.
+  await page.evaluate(() => {
+    localStorage.setItem("hghub_app_v1", JSON.stringify({ favs: [5001, 991] }));
+    localStorage.setItem("hghub_fav_seen", JSON.stringify({ 991: 2, 5001: 4 }));
+  });
+  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&detail=episodes`);
+  const favUpdates = (fn, ...args) => page.evaluate(async ([name, rest]) => (await import("/src/favUpdates.ts"))[name](...rest), [fn, args]);
+  assert.deepEqual(await favUpdates("checkFavUpdates", [5001, 991]), [991], "Only the favourite with new episodes is reported");
+  await page.getByText("更新至 4 集", { exact: true }).waitFor({ state: "visible" });
+  assert.match(await page.getByRole("button", { name: /我的收藏/ }).innerText(), /我的收藏\s*·\s*1/, "The favourites tab shows the update count");
+  const firstCard = await page.locator(".grid button").first().innerText();
+  assert(firstCard.includes("更新至 4 集"), "The updated favourite comes first");
+  assert.deepEqual(await favUpdates("checkFavUpdates", [5001, 991]), [], "A second check within 6 hours is skipped");
+  await favUpdates("markSeen", 991, 4);
+  await page.getByText("更新至 4 集", { exact: true }).waitFor({ state: "detached" });
+  report.passed.push("Favourite updates: new episodes are found per favourite, shown first with a badge and a tab count; checks are 6 hours apart; seeing the series clears it");
+  await page.evaluate(() => localStorage.clear());
+
   // HEVC: an Android device that reports HEVC support tries the hevc stream first (same resolution, about
   // half the bitrate); when it fails, the same episode switches to H.264 without the error overlay. A decode
   // failure stops preferring HEVC on this device, a network failure does not. Offline caching uses hevc only
@@ -216,8 +306,21 @@ try {
   await until(() => playlists.length > 0, "Next play requests a playlist");
   await page.waitForTimeout(300);
   assert(playlists.every(u => !u.includes("-hevc")), `After a decode failure this device plays H.264 directly: ${playlists}`);
+  // The settings switch shows why HEVC is off, can retry it, and can turn it off by hand.
+  const hevc = (fn, ...args) => page.evaluate(async ([name, rest]) => {
+    const m = await import("/src/hevc.ts");
+    m[name]?.(...rest);
+    return { status: m.hevcStatus(), prefer: m.preferHevc() };
+  }, [fn, args]);
+  assert.deepEqual(await hevc("hevcStatus"), { status: "auto_off", prefer: false }, "Settings explain the automatic switch to H.264");
+  assert.deepEqual(await hevc("setHevcEnabled", true), { status: "on", prefer: true }, "Turning it back on retries HEVC");
+  assert.deepEqual(await hevc("setHevcEnabled", false), { status: "off", prefer: false }, "Turning it off plays H.264 only");
+  await openHevcFeed("403");
+  await until(() => playlists.length > 0, "Next play requests a playlist");
+  await page.waitForTimeout(300);
+  assert(playlists.every(u => !u.includes("-hevc")), `Switched off by hand, HEVC is not tried: ${playlists}`);
   report.metrics.hevc = { network_fallback: networkFallback, decode_fallback_ms: decodeFallbackMs };
-  report.passed.push("HEVC: tried first, falls back to H.264 without an error overlay; decode failure disables it; cache uses hevc only after it played");
+  report.passed.push("HEVC: tried first, falls back to H.264 without an error overlay; decode failure disables it; cache uses hevc only after it played; settings switch retries or turns it off");
   await page.evaluate(() => localStorage.clear());
 
   assert.deepEqual(errors, [], "No page errors");

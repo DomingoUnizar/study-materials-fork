@@ -14,6 +14,7 @@ export const playbackLogApi = {
   set: (enabled: boolean) => invoke<Status>("playback_log_set", { enabled }),
   write: (entries: Entry[]) => invoke<void>("playback_log_write", { entries }),
   read: () => invoke<string>("playback_log_read"),
+  export: () => invoke<string>("playback_log_export"),
 };
 let state: Snapshot = { enabled: false, path: null, error: null, ready: false, pending: false };
 const listeners = new Set<() => void>();
@@ -70,12 +71,25 @@ export async function setPlaybackLog(on: boolean) {
   } finally { if (state.pending) publish({ pending: false }); }
 }
 
-export async function copyPlaybackLog() {
+/* 日志最多约 2MB，整份放进手机剪贴板再同步或转发到电脑上常常传不过去（拿到的是空的）。
+   复现问题后马上复制，要看的记录都在末尾，所以只复制最近一段（按整行截断）。 */
+const COPY_LIMIT = 150_000;
+
+export async function copyPlaybackLog(): Promise<{ copied: number; total: number }> {
   await flushPlaybackLog();
   const text = await playbackLogApi.read();
   if (!text) throw new Error("尚无诊断日志，请开启后复现问题");
   if (!navigator.clipboard) throw new Error("当前环境无法使用剪贴板，请从日志目录取出 playback.log");
-  await navigator.clipboard.writeText(text);
+  const tail = text.length > COPY_LIMIT ? text.slice(text.indexOf("\n", text.length - COPY_LIMIT) + 1) : text;
+  await navigator.clipboard.writeText(tail);
+  return { copied: tail.length, total: text.length };
+}
+
+/** 存成文件（手机上是「下载」文件夹），返回保存路径 */
+export async function exportPlaybackLog(): Promise<string> {
+  await flushPlaybackLog();
+  try { return await playbackLogApi.export(); }
+  catch (e) { throw new Error(typeof e === "string" ? e : (e as Error)?.message || "保存日志失败"); }
 }
 
 export function mediaResource(raw: string) {
@@ -218,5 +232,9 @@ export function observeHls(hls: Hls, trace: (event: string, data?: Data) => void
 export function installPlaybackPageEvents() {
   document.addEventListener("visibilitychange", () => tracePlayback("page.visibility", { visibility: document.visibilityState }));
   window.addEventListener("pagehide", () => { tracePlayback("page.hide"); void flushPlaybackLog(); });
+  // 切后台后回来白屏时，看页面是否被冻结过、回到前台后脚本是否恢复运行
+  document.addEventListener("freeze", () => { tracePlayback("page.freeze"); void flushPlaybackLog(); });
+  document.addEventListener("resume", () => tracePlayback("page.resume"));
+  window.addEventListener("pageshow", e => tracePlayback("page.show", { persisted: e.persisted }));
   document.addEventListener("securitypolicyviolation", e => tracePlayback("security.csp_violation", { directive: e.effectiveDirective, disposition: e.disposition, resource: mediaResource(e.blockedURI) }));
 }

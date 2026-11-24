@@ -20,6 +20,7 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
         <IPlayF size={9} />{fmt(v.hot)}
       </span>
       <div className="absolute inset-x-0 bottom-0 p-2">
+        {v.episode_count > 0 && <div className="text-[10px] font-semibold text-white/85 tsh mb-0.5">共 {v.episode_count} 集</div>}
         <div className="text-[11.5px] font-medium text-white leading-snug clamp-2 tsh">{v.title}</div>
         <div className="flex items-center justify-between mt-1">
           <span className="text-[9.5px] text-white/65 truncate max-w-[60%]">{v.author?.name || "黄果短剧"}</span>
@@ -30,17 +31,16 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
   );
 }
 
-/* ——— 近无缝瀑布流 ——— */
+/* ——— 近无缝封面网格 ———
+ * 卡片比例固定，逐行排列和原来的 CSS 多栏外观一样。多栏是先填满左栏再填右栏，
+ * 每加载一页，卡片就在栏间整体挪动，右栏换成一批封面还没加载的条目，顺序也乱。 */
 export function Masonry({ videos, onOpen, wide = false, gap = "gap-1" }: {
   videos: VideoCard[]; onOpen: (v: VideoCard) => void; wide?: boolean; gap?: string;
 }) {
-  const mb = gap === "gap-1" ? "mb-1" : "mb-1.5";
   return (
-    <div className={`${wide ? "columns-3 xl:columns-4" : "columns-2"} ${gap} [column-fill:balance]`}>
+    <div className={`grid ${wide ? "grid-cols-3 xl:grid-cols-4" : "grid-cols-2"} ${gap}`}>
       {videos.map((v) => (
-        <div key={v.id} className={`break-inside-avoid ${mb}`}>
-          <WaterfallCard v={v} onOpen={() => onOpen(v)} />
-        </div>
+        <WaterfallCard key={v.id} v={v} onOpen={() => onOpen(v)} />
       ))}
     </div>
   );
@@ -54,7 +54,7 @@ export function RowCard({ v, onOpen }: { v: VideoCard; onOpen: () => void }) {
         <Img src={v.cover} />
         <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/75 to-transparent" />
         <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-[8.5px] font-bold brand-grad">
-          {v.is_finished ? "完结" : `${v.episode_count}集`}
+          {v.is_finished ? (v.episode_count > 0 ? `完结 · ${v.episode_count}集` : "完结") : `${v.episode_count}集`}
         </span>
         <span className="absolute bottom-1.5 right-1.5 flex items-center gap-0.5 text-[9px] font-semibold text-white/90 tsh"><IPlayF size={9} />{fmt(v.hot)}</span>
       </div>

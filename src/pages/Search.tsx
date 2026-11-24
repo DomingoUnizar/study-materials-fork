@@ -5,6 +5,7 @@ import { useStore } from "../store";
 import { Masonry, RankRow } from "../components/cards";
 import { Empty } from "../components/ui";
 import { IBack, IClose, IFireF, IRefresh, ISearch, ITrophy } from "../icons";
+import { useTagFilter, visibleByTags } from "../contentFilter";
 
 const HOT_TAGS = ["都市", "逆袭", "古风", "系统", "后宫", "校园", "仙侠", "职场", "大男主", "御姐", "脑洞", "奇幻"];
 
@@ -58,6 +59,8 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
   };
 
   const querying = submitted.length > 0;
+  const filterOn = useTagFilter();
+  const shown = visibleByTags(items, filterOn);
 
   return (
     <div className="absolute inset-0 bg-bg flex flex-col">
@@ -117,10 +120,10 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
           </>
         ) : (
           <>
-            <div className="text-[11.5px] text-mut mt-1 mb-2.5">「{submitted}」共 <span className="text-primary font-bold">{items.length}</span> 条结果</div>
-            {items.length ? (
+            <div className="text-[11.5px] text-mut mt-1 mb-2.5">「{submitted}」共 <span className="text-primary font-bold">{shown.length}</span> 条结果</div>
+            {shown.length ? (
               <>
-                <Masonry videos={items} wide={wide} onOpen={(v) => push({ kind: "feed", videoIds: items.map((x) => x.id), index: items.findIndex((x) => x.id === v.id), title: `搜索 · ${submitted}` })} />
+                <Masonry videos={shown} wide={wide} onOpen={(v) => push({ kind: "feed", videoIds: shown.map((x) => x.id), index: shown.findIndex((x) => x.id === v.id), title: `搜索 · ${submitted}` })} />
                 <div className="flex justify-center py-4">
                   {loading ? <div className="w-6 h-6 spinner" />
                     : page < pages ? (
@@ -164,7 +167,9 @@ export function RankPage({ onBack, wide }: { onBack: () => void; wide: boolean }
     return () => { alive = false; };
   }, [tab, toast]);
 
-  const max = Math.max(1, ...items.map((x) => x.metric_value || 0));
+  const filterOn = useTagFilter();
+  const shown = visibleByTags(items, filterOn);
+  const max = Math.max(1, ...shown.map((x) => x.metric_value || 0));
   const meta = RANK_TABS.find((t) => t.k === tab)!;
 
   return (
@@ -194,10 +199,10 @@ export function RankPage({ onBack, wide }: { onBack: () => void; wide: boolean }
       <div className="flex-1 scroll-y px-3.5 pt-3 pb-8">
         {loading ? (
           <div className="flex justify-center py-12"><div className="w-8 h-8 spinner" /></div>
-        ) : items.length ? (
-          items.map((it) => (
+        ) : shown.length ? (
+          shown.map((it) => (
             <RankRow key={`${it.video_id}-${it.rank}`} item={it} metricMax={max}
-              onOpen={() => push({ kind: "feed", videoIds: items.map((x) => x.video_id), index: items.findIndex((x) => x.video_id === it.video_id), title: "HG 热榜" })} />
+              onOpen={() => push({ kind: "feed", videoIds: shown.map((x) => x.video_id), index: shown.findIndex((x) => x.video_id === it.video_id), title: "HG 热榜" })} />
           ))
         ) : (
           <Empty icon={<ITrophy size={26} />} title="榜单暂时为空" sub="稍后再来看看，或者去首页刷刷推荐" />

@@ -45,6 +45,21 @@ type Props = {
   className?: string;
 };
 
+/* 安卓 WebView 静音时会关掉音频输出、取消静音时再重新打开：每次画面停一下，还有爆音。
+   本次启动后开过一次声音，之后的「静音」就把音量压到听不见（0.0001），不真正关掉输出；
+   还没开过声音时照旧真正静音：不占用音频焦点，不打断其它应用正在放的音乐。 */
+let soundTurnedOn = false;
+const SILENT = 0.0001;
+function audioOutput(muted: boolean, volume: number) {
+  if (!muted && volume > 0) soundTurnedOn = true;
+  return muted && soundTurnedOn && platform === "android" ? { muted: false, volume: SILENT } : { muted, volume };
+}
+function applyAudio(v: HTMLVideoElement, muted: boolean, volume: number) {
+  const out = audioOutput(muted, volume);
+  if (v.volume !== out.volume) v.volume = out.volume;
+  if (v.muted !== out.muted) v.muted = out.muted;
+}
+
 /** 只负责「播」：hls.js + video 元素，控制条由外层渲染。 */
 const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain",
@@ -129,8 +144,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     seek: (t: number, sourceOrAutoResume: string | boolean = "handle") => safeSeek(t, sourceOrAutoResume),
     trace,
     rate: (r: number) => { const v = videoRef.current; if (v) v.playbackRate = r; },
-    mute: (m: boolean) => { const v = videoRef.current; if (v) v.muted = m; },
-    volume: (vol: number) => { const v = videoRef.current; if (v) v.volume = vol; },
+    mute: (m: boolean) => { const v = videoRef.current; if (v) applyAudio(v, m, volume); },
+    volume: (vol: number) => { const v = videoRef.current; if (v) applyAudio(v, muted, vol); },
   }));
 
   useEffect(() => {
@@ -155,8 +170,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     const applySettings = () => {
       const v = videoRef.current;
       if (!v) return;
-      v.volume = volume;
-      v.muted = muted;
+      applyAudio(v, muted, volume);
       v.playbackRate = rate;
     };
     applySettings();
@@ -281,13 +295,11 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
 
-  useEffect(() => { if (videoRef.current) videoRef.current.muted = muted; }, [muted]);
-  useEffect(() => { if (videoRef.current) videoRef.current.volume = volume; }, [volume]);
+  useEffect(() => { if (videoRef.current) applyAudio(videoRef.current, muted, volume); }, [muted, volume]);
   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = rate; }, [rate]);
 
   const reapply = (v: HTMLVideoElement) => {
-    v.volume = volume;
-    v.muted = muted;
+    applyAudio(v, muted, volume);
     v.playbackRate = rate;
   };
 
@@ -322,7 +334,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         playsInline
         webkit-playsinline="true"
         preload="auto"
-        muted={muted}
+        muted={audioOutput(muted, volume).muted}
         loop={loop}
         onClick={onClick}
         className={`w-full h-full bg-black ${fit === "cover" ? "object-cover" : "object-contain"}`}

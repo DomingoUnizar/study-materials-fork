@@ -13,8 +13,9 @@ import { disableHevc, hevcPlayed, preferHevc } from "../hevc";
 import { setBackHandler } from "../back";
 import {
   IBack, IBoltF, ICheck, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IDownload, IExpand, IFileText, IHeart, IHeartF,
-  ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
+  ILink, IList, ILockF, INext, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
 } from "../icons";
+import { markSeen } from "../favUpdates";
 
 /* 竖屏进度条（连同上方的标题、详情区）离屏幕底部至少 56px，避开安卓全面屏手势区 */
 const MOBILE_BAR_BOTTOM = 56;
@@ -114,8 +115,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [holdSpeed, setHoldSpeed] = useState(false);
   const [speedLock, setSpeedLock] = useState(false);
   const [lockArmed, setLockArmed] = useState(false);
+  const [unlockArmed, setUnlockArmed] = useState(false);
   const holdRef = useRef(false);
   const lockArmedRef = useRef(false);
+  const unlockArmedRef = useRef(false);
+  /** 单指触摸的起点，用来判断「最后一集还往上划」 */
+  const touchStartRef = useRef<{ x: number; y: number; hold: boolean } | null>(null);
   /* 竖屏下横屏视频适应模式 + 双指无级缩放/平移 */
   const [portraitFit, setPortraitFit] = useState<"contain" | "cover">("contain");
   const [zoom, setZoom] = useState({ scale: 1, x: 0, y: 0, gesturing: false });
@@ -141,6 +146,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* 剧集模式（移动端）：从右往左划进入当前这部剧，竖向列表换成本剧各集；从左往右划回到原列表，该剧停在刚看的那一集 */
   const [seriesMode, setSeriesMode] = useState(false);
   const inSeries = seriesMode && kind === "video" && episodes.length > 0;
+  /* 移动端标题、详情、进度条这一块离屏幕底部的距离（见 MOBILE_BAR_BOTTOM） */
+  const mobileBarBottom = `max(calc(var(--sab, 0px) + ${bottomInset}px), ${MOBILE_BAR_BOTTOM}px)`;
   const listKeys: (number | string)[] = inSeries ? episodes.map((e) => `ep-${e.ep_num}`) : videoIds;
   const listLength = listKeys.length;
   const listIndex = inSeries ? Math.max(0, episodes.findIndex((e) => e.ep_num === curEp)) : index;
@@ -543,10 +550,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     }
     lockArmedRef.current = false;
     setLockArmed(false);
+    unlockArmedRef.current = false;
+    setUnlockArmed(false);
+  };
+
+  /* 剧集模式里已经是最后一集还往上划（切下一集的方向）：给个提示，不然看起来像没反应 */
+  const hintNoNextEp = (dx: number, dy: number) => {
+    if (inSeries && !fs && listIndex >= listLength - 1 && -dy > 60 && Math.abs(dx) < -dy) toast("没有下一集啦", "info");
   };
 
   const onTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (isDesktop || controlsLocked) return;
+    touchStartRef.current = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, hold: false } : null;
     if (e.touches.length === 2) {
       cancelSingleGesture();
       const t0 = e.touches[0];
@@ -589,6 +604,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   const onTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
     if (isDesktop) return;
+    const start = touchStartRef.current;
+    if (start && e.touches.length === 0 && !pinchRef.current && !start.hold && e.changedTouches.length === 1) {
+      touchStartRef.current = null;
+      hintNoNextEp(e.changedTouches[0].clientX - start.x, e.changedTouches[0].clientY - start.y);
+    }
     if (pinchRef.current && e.touches.length < 2) {
       pinchRef.current = null;
       setZoom((prev) =>
@@ -623,9 +643,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         clearTapTimer();
         cur.mode = "hold";
         holdRef.current = true;
+        if (touchStartRef.current) touchStartRef.current.hold = true;
         setHoldSpeed(true);
         setLockArmed(false);
         lockArmedRef.current = false;
+        setUnlockArmed(false);
+        unlockArmedRef.current = false;
         try { navigator.vibrate?.(25); } catch { /* ignore */ }
       }, 380) as unknown as number,
     };
@@ -644,13 +667,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     const dx = rotated ? rawDy : rawDx;
     const dy = rotated ? -rawDx : rawDy;
 
-    /* 长按中：上滑 64px 进入「松开即锁定」 */
+    /* 长按中：上滑 64px 进入「松开即锁定 2x」；已经锁定或调过倍速时，下滑 64px 进入「松开恢复 1x」 */
     if (g.mode === "hold") {
       const upDist = rotated ? (e.clientX - g.startX) : (g.startY - e.clientY);
-      const armed = upDist > 64;
+      const armed = !speedLock && upDist > 64;
+      const unarmed = (speedLock || rate !== 1) && upDist < -64;
       if (armed !== lockArmedRef.current) {
         lockArmedRef.current = armed;
         setLockArmed(armed);
+      }
+      if (unarmed !== unlockArmedRef.current) {
+        unlockArmedRef.current = unarmed;
+        setUnlockArmed(unarmed);
       }
       return;
     }
@@ -680,12 +708,20 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       setHoldSpeed(false);
       if (!cancelled && lockArmedRef.current) {
         setSpeedLock(true);
-        toast("已锁定 2.0x 倍速 · 点顶部标签解除", "info");
+        toast("已锁定 2.0x 倍速 · 长按下滑或点顶部标签解除", "info");
+      } else if (!cancelled && unlockArmedRef.current) {
+        setSpeedLock(false);
+        setRate(1);
+        toast("已恢复 1.0x 倍速", "info");
       }
       lockArmedRef.current = false;
       setLockArmed(false);
+      unlockArmedRef.current = false;
+      setUnlockArmed(false);
       return;
     }
+    // 鼠标拖动（触屏的判断在 onTouchEnd，原生纵向滚动会让指针事件提前取消）
+    if (!cancelled && g.mode === "pan" && e?.pointerType === "mouse") hintNoNextEp(e.clientX - g.startX, e.clientY - g.startY);
     if (g.mode === "swipe") {
       // 画面左右划只用来进出剧集模式：从右往左（dx < 0）进入、从左往右返回，全屏下不切换；定位只用进度条
       const dx = e ? e.clientX - g.startX : 0;
@@ -828,6 +864,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setEpMap((m) => ({ ...m, [curId]: ep }));
     setPanel(null);
   };
+  const nextEp = episodes.find((e) => e.ep_num === curEp + 1);
+
+  /* 收藏更新提醒：在这里看到了收藏的最新详情（点开它，或刚收藏它）就算看过 */
+  const favHere = isFav(curId);
+  useEffect(() => {
+    if (kind === "video" && detail && favHere) markSeen(curId, detail.episode_count || detail.episodes?.length || 0);
+  }, [kind, detail, favHere, curId]);
 
   const likeCount = useMemo(() => {
     const base = meta.like;
@@ -948,10 +991,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   )}
                   {!isDesktop && holdSpeed && (
                     <div
-                      className={`absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-4 h-10 rounded-xl backdrop-blur-md elev-2 transition-all duration-200 ${lockArmed ? "bg-primary text-on-primary scale-110" : "hg-chip-strong hg-ink-2"}`}
+                      className={`absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-4 h-10 rounded-xl backdrop-blur-md elev-2 transition-all duration-200 ${lockArmed || unlockArmed ? "bg-primary text-on-primary scale-110" : "hg-chip-strong hg-ink-2"}`}
                       style={{ top: "38%" }}>
                       <ILockF size={16} />
-                      <span className="text-[12.5px] font-bold">{lockArmed ? "松开锁定 2.0x" : "上滑到此锁定倍速"}</span>
+                      <span className="text-[12.5px] font-bold">
+                        {unlockArmed ? "松开恢复 1.0x" : lockArmed ? "松开锁定 2.0x" : speedLock || rate !== 1 ? "下滑解除倍速" : "上滑到此锁定倍速"}
+                      </span>
                     </div>
                   )}
 
@@ -1002,6 +1047,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           {paused ? <IPlayF size={18} /> : <IPauseF size={17} />}
                         </button>
                         <span className="shrink-0 text-[11.5px] font-semibold hg-ink-2 tabular-nums">{fmtTime(time)}</span>
+                        {kind === "video" && episodes.length > 1 && (
+                          <button onClick={() => { if (nextEp) pickEp(nextEp.ep_num); }} disabled={!nextEp}
+                            aria-label="下一集" title={nextEp ? `下一集（第 ${nextEp.ep_num} 集）` : "已是最后一集"}
+                            className="hg-chip shrink-0 w-9 h-9 rounded-full flex items-center justify-center pressable disabled:opacity-40">
+                            <INext size={16} />
+                          </button>
+                        )}
                         <button
                           onClick={() => {
                             if (speedLock) { setSpeedLock(false); return; }
@@ -1125,7 +1177,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   颜色写死不跟主题走：浅色主题下这些字必须仍是白色 */}
               {!fs && !clean && !isDesktop && (
                 <div className="absolute right-3 z-20 flex flex-col items-center gap-[16px]"
-                  style={{ bottom: `calc(max(calc(var(--sab, 0px) + ${bottomInset}px), ${MOBILE_BAR_BOTTOM}px) + 92px)` }}>
+                  style={{ bottom: `calc(${mobileBarBottom} + 92px)` }}>
                   <button onClick={onFav} className="flex flex-col items-center gap-1 pressable" aria-pressed={isFav(curId)} aria-label="收藏">
                     {isFav(curId) ? <IStarF size={27} className="hg-gold" /> : <IStar size={27} className="hg-ink hg-ov-shadow" />}
                     <span className="text-[10.5px] hg-ink-2 hg-ov-shadow">收藏</span>
@@ -1227,9 +1279,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
               {/* 移动端：标题 + 详情标签 + 进度线（清屏 clean 模式下隐藏） */}
               {!fs && !clean && !isDesktop && (
-                <div className="absolute inset-x-0 z-20" style={{ bottom: `max(calc(var(--sab, 0px) + ${bottomInset}px), ${MOBILE_BAR_BOTTOM}px)` }}>
-                  <div className="absolute inset-x-0 bottom-0 h-[190px] pointer-events-none"
-                    style={{ background: "linear-gradient(0deg, rgba(0,0,0,.82) 0%, rgba(0,0,0,.42) 45%, transparent 100%)" }} />
+                <div className="absolute inset-x-0 z-20" style={{ bottom: mobileBarBottom }}>
+                  {/* 压暗渐变从屏幕底边铺起；只挂在这一块底下时，抬高后进度条下方会多出一条明暗断层 */}
+                  <div className="absolute inset-x-0 pointer-events-none"
+                    style={{ bottom: `calc(-1 * ${mobileBarBottom})`, height: `calc(190px + ${mobileBarBottom})`,
+                      background: "linear-gradient(0deg, rgba(0,0,0,.82) 0%, rgba(0,0,0,.42) 45%, transparent 100%)" }} />
                   <p className="relative px-4 pb-2 text-[14px] font-semibold leading-snug hg-ink hg-ov-shadow clamp-2">{meta.title}</p>
                   <div className="relative pt-1.5 pb-2">
                     <button onClick={() => setPanel("detail")}

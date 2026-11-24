@@ -92,32 +92,45 @@ try {
   assert(fresh.length > 0, "Reload must request a newly signed play address");
   report.passed.push("Feed: stale signed address shows the error overlay; reload fetches a fresh address");
 
+  // Upstream's recommendation order never changes, so Home picks random pages: with the page count known from an
+  // earlier visit (50 pages) and Math.random fixed at 0.5, the first request is page 26 instead of page 1.
+  await page.addInitScript(() => {
+    if (!location.search.includes("random=1")) return;
+    localStorage.setItem("hghub_feed_pages", "50");
+    Math.random = () => 0.5;
+  });
+  await page.goto(`${origin}tests/api-loading.html?page=home&random=1`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  const firstPage = (await calls())[0].args.page;
+  assert.equal(firstPage, 26, `Home starts on a random page (got page ${firstPage})`);
+  await page.evaluate(() => localStorage.clear());
+  report.passed.push("Home: starts on a random page among the known pages instead of always page 1");
+
   await page.goto(`${origin}tests/api-loading.html`);
   await page.waitForFunction(() => window.apiLoadingFixture.ready);
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   assert.equal((await calls()).length, 0, "Hidden categories must not prefetch");
   await page.evaluate(() => window.apiLoadingFixture.setActive(true));
-  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 5);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 3);
+  // 「AI换脸」「AI魔改」are gone upstream (HTTP 410 内容已下线): not listed, not requested.
+  for (const gone of ["AI换脸", "AI魔改"]) assert.equal(await page.getByRole("region", { name: gone, exact: true }).count(), 0, `${gone} is not listed`);
+  assert(!(await calls()).some(r => ["ai-huanlian", "ai-mogai"].includes(r.args.cate)), "Removed channels are not requested");
   await complete("api_category", "ai-duanju", "item");
   await visible(page.getByText("已加载ai-duanju", { exact: true }));
-  await visible(page.getByRole("region", { name: "AI魔改", exact: true }).getByText("加载中…", { exact: true }));
-  await complete("api_category", "ai-huanlian", "empty");
-  await visible(page.getByRole("region", { name: "AI换脸", exact: true }).getByText("暂无内容", { exact: true }));
+  await visible(page.getByRole("region", { name: "AI成人漫剧", exact: true }).getByText("加载中…", { exact: true }));
   await complete("api_posts", "", "item");
   await visible(page.getByText("已加载api_posts", { exact: true }));
   await complete("api_category", "ai-manju", "503");
   await page.getByRole("button", { name: "重试AI成人漫剧", exact: true }).click();
-  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 6);
-  await complete("api_category", "ai-manju", "item");
-  await visible(page.getByText("已加载ai-manju", { exact: true }));
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 4);
+  await complete("api_category", "ai-manju", "empty");
+  await visible(page.getByRole("region", { name: "AI成人漫剧", exact: true }).getByText("暂无内容", { exact: true }));
   assert.equal((await calls()).filter(r => r.args.cate === "ai-duanju").length, 1, "Retry must only reload the failed channel");
-  await complete("api_category", "ai-mogai", "404");
-  await visible(page.getByRole("button", { name: "重试AI魔改", exact: true }));
   await page.evaluate(() => window.apiLoadingFixture.setActive(false));
   await page.evaluate(() => window.apiLoadingFixture.setActive(true));
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
-  assert.equal((await calls()).length, 6, "Revisiting must preserve previews without reloading all channels");
-  report.passed.push("Category: defer hidden loading, show successful rows/posts before slow row, independent error/retry, preserve data on revisit");
+  assert.equal((await calls()).length, 4, "Revisiting must preserve previews without reloading all channels");
+  report.passed.push("Category: only live channels (AI换脸/AI魔改 removed), defer hidden loading, show successful rows/posts before slow row, independent error/retry, preserve data on revisit");
   // Channel sorting: 「最新」asks upstream for newest first; 「最热」is upstream's default order; 「高分」re-sorts locally.
   await page.goto(`${origin}tests/api-loading.html?page=channel`);
   await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
@@ -128,7 +141,17 @@ try {
   await page.getByRole("button", { name: "高分", exact: true }).click();
   await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 300)));
   assert.equal((await calls()).length, 2, "高分 only re-sorts what is loaded");
-  report.passed.push("Channel: 最新 uses upstream sort=new, 最热 the default order, 高分 sorts locally");
+  // Series tagged 男同 are hidden by default. Cards fill the grid row by row: CSS columns filled the left column
+  // first and moved cards between columns whenever a page loaded, so the right column kept losing its covers.
+  await complete("api_category", "ai-duanju", "mixed"); // the superseded 最新 request: ignored
+  await complete("api_category", "ai-duanju", "mixed");
+  await visible(page.getByText("另一部", { exact: true }));
+  assert.equal(await page.getByText("男同题材", { exact: true }).count(), 0, "Series tagged 男同 are hidden");
+  const firstCard = await page.getByText("已加载ai-duanju", { exact: true }).boundingBox();
+  const secondCard = await page.getByText("另一部", { exact: true }).boundingBox();
+  assert(Math.abs(firstCard.y - secondCard.y) < 2 && secondCard.x > firstCard.x, "Cards fill the grid row by row");
+  assert.equal(await page.getByText("共 1 集", { exact: true }).count(), 4, "Every card shows its episode count above the title");
+  report.passed.push("Channel: 最新 uses upstream sort=new, 最热 the default order, 高分 sorts locally; 男同-tagged series hidden; grid fills row by row; episode count on every cover");
   assert.deepEqual(errors, [], "No page errors");
   assert.deepEqual(report.external, [], "No upstream traffic");
   await page.screenshot({ path: join(output, "final.png"), fullPage: true });

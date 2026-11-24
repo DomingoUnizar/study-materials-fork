@@ -15,6 +15,7 @@ import { ToastHost } from "./components/ui";
 import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
 import ResizeHandles from "./components/ResizeHandles";
 import { tracePlayback } from "./playbackDiagnostics";
+import { useFavUpdateCheck } from "./favUpdates";
 import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF, Logo } from "./icons";
 
 /* ============ 底部标签栏（Android）—— 细瘦纯文字、低侵入 ============ */
@@ -229,10 +230,11 @@ function MobileShell() {
 
 /* ============ 入口 ============ */
 export default function App() {
-  const { platform, loginOpen, setLoginOpen, tab, setTab, stack, pop, fs, setFs } = useStore();
+  const { platform, loginOpen, setLoginOpen, tab, setTab, stack, pop, fs, setFs, favs, toast } = useStore();
   useEffect(() => {
     tracePlayback("navigation.change", { tab, stack: stack.map(p => ({ page: p.kind, key: p.key })), login_open: loginOpen });
   }, [tab, stack, loginOpen]);
+  useFavUpdateCheck(favs, (n) => toast(`收藏的 ${n} 部剧有更新，在「我的 → 我的收藏」查看`, "star"));
 
   /* —— 安卓硬件返回键 ——
      层级：全屏 → 面板/弹层 → 登录框 → 页面栈 → 回首页 → 退出应用。

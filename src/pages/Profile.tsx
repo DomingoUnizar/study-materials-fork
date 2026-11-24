@@ -6,6 +6,7 @@ import { Avatar, Empty, Img } from "../components/ui";
 import { IChevR, IClock, IDownload, ILogout, ISettings, IStar, ITrash, IUser } from "../icons";
 import { cacheEpisodes, offlineCover, removeOffline, useOffline, type OfflineEpisode } from "../offline";
 import { offlineLabel } from "../components/Panels";
+import { useFavUpdates } from "../favUpdates";
 
 /** 收藏、历史每次加载 12 条，滑到底再加载下一批，避免一次向上游请求几十条详情 */
 const PAGE = 12;
@@ -22,7 +23,10 @@ export default function Profile({ wide }: { wide: boolean }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const moreRef = useRef<HTMLDivElement>(null);
 
-  const ids = tab === "fav" ? favs : tab === "history" ? history.map((h) => h.id) : [];
+  const updates = useFavUpdates();
+  /* 有更新的收藏排在最前面，点开看过后回到原位置 */
+  const updatedFavs = favs.filter((id) => id in updates);
+  const ids = tab === "fav" ? [...updatedFavs, ...favs.filter((id) => !(id in updates))] : tab === "history" ? history.map((h) => h.id) : [];
   const shown = ids.slice(0, limit);
   const cards = shown.map((id) => details[id]).filter((d): d is Detail => !!d);
   /** 观看记录里这条的进度（收藏页没有） */
@@ -110,7 +114,9 @@ export default function Profile({ wide }: { wide: boolean }) {
           {([["fav", "我的收藏"], ["history", "观看历史"], ["cache", "离线缓存"]] as const).map(([k, l]) => (
             <button key={k} onClick={() => setTab(k)}
               className={`flex-1 h-8 rounded-(--r-ctl) text-[12px] font-semibold pressable ${tab === k ? "tonal text-on-sec" : "text-mut"}`}
-              style={tab === k ? { background: "var(--p-sec)", color: "var(--p-primary)" } : undefined}>{l}</button>
+              style={tab === k ? { background: "var(--p-sec)", color: "var(--p-primary)" } : undefined}>
+              {l}{k === "fav" && updatedFavs.length > 0 && <span className="ml-1 text-primary" aria-label={`${updatedFavs.length} 部有更新`}>· {updatedFavs.length}</span>}
+            </button>
           ))}
         </div>
 
@@ -132,6 +138,11 @@ export default function Profile({ wide }: { wide: boolean }) {
                   {!!p && (
                     <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-full bg-black/65 text-[9.5px] text-white/90 leading-none">
                       第 {p.ep} 集{p.t > 3 ? ` · ${fmtTime(p.t)}` : ""}
+                    </div>
+                  )}
+                  {tab === "fav" && c.id in updates && (
+                    <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-full bg-primary text-on-primary text-[9.5px] font-semibold leading-none">
+                      更新至 {updates[c.id]} 集
                     </div>
                   )}
                   <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-1.5">

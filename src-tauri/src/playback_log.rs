@@ -259,6 +259,42 @@ pub fn playback_log_read() -> Result<String, String> {
     Ok(text)
 }
 
+/// 把诊断日志存成文件，方便从手机里取出来：大段文字经剪贴板同步、聊天软件转发常被截断。
+/// 安卓先存公共「下载」目录（Android 11 起应用无需权限即可在这里新建自己的文件），
+/// 存不进去再存到系统给本应用的下载目录；桌面端存到系统「下载」目录。返回保存的路径。
+#[tauri::command]
+pub async fn playback_log_export(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Manager;
+    let text = playback_log_read()?;
+    if text.is_empty() {
+        return Err("尚无诊断日志，请开启后复现问题".into());
+    }
+    let t = time::OffsetDateTime::now_utc();
+    let name = format!(
+        "HGhub-diagnostics-{:04}{:02}{:02}-{:02}{:02}{:02}.txt",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    );
+    let mut dirs = Vec::new();
+    if cfg!(target_os = "android") {
+        dirs.push(std::path::PathBuf::from("/storage/emulated/0/Download"));
+    }
+    if let Ok(dir) = app.path().download_dir() {
+        dirs.push(dir);
+    }
+    for dir in dirs {
+        let path = dir.join(&name);
+        if fs::create_dir_all(&dir).is_ok() && fs::write(&path, &text).is_ok() {
+            return Ok(path.display().to_string());
+        }
+    }
+    Err("无法保存日志文件，请改用复制".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

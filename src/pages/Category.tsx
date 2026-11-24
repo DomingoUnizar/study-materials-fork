@@ -5,17 +5,18 @@ import { useStore } from "../store";
 import { Masonry, RowCard } from "../components/cards";
 import { Empty, Img } from "../components/ui";
 import { IBack, IChevR, IGrid, ITrophy } from "../icons";
+import { useTagFilter, visibleByTags } from "../contentFilter";
 
+/* 「AI换脸」（ai-huanlian）和「AI魔改」（ai-mogai）上游已下线：接口返回 HTTP 410「内容已下线」 */
 export const CHANNELS = [
   { cate: "ai-duanju", name: "AI成人短剧", desc: "高能反转 · 一口气看完" },
   { cate: "ai-manju", name: "AI成人漫剧", desc: "国创漫剧 · 每周更新" },
-  { cate: "ai-huanlian", name: "AI换脸", desc: "换脸演绎 · 全新剧情" },
-  { cate: "ai-mogai", name: "AI魔改", desc: "魔改名场面 · 脑洞大开" },
 ] as const;
 
 /* ================= 分类总览 ================= */
 export default function Category({ wide, active }: { wide: boolean; active: boolean }) {
   const { push } = useStore();
+  const filterOn = useTagFilter();
   const [rows, setRows] = useState<Record<string, VideoCard[]>>({});
   const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState<Record<string, boolean>>({});
@@ -80,7 +81,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
         </button>
 
         {CHANNELS.map((c, ci) => {
-          const list = rows[c.cate] || [];
+          const list = visibleByTags(rows[c.cate] || [], filterOn);
           return (
             <section key={c.cate} aria-label={c.name} className="mb-5 a-rise" style={{ animationDelay: `${Math.min(ci * 50, 300)}ms` }}>
               <button onClick={() => push({ kind: "channel", cate: c.cate, name: c.name })}
@@ -154,6 +155,7 @@ function PreviewStatus({ name, loading, error, onRetry }: { name: string; loadin
 /* ================= 频道详情页 ================= */
 export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: string; onBack: () => void; wide: boolean }) {
   const { push } = useStore();
+  const filterOn = useTagFilter();
   const [sort, setSort] = useState<"最新" | "最热" | "高分">("最新");
   /* 「最新」交给上游按上架时间排（sort=new）；「最热」就是上游默认顺序；「高分」上游不支持，只对已加载部分排序 */
   const order = sort === "最新" ? "new" : undefined;
@@ -214,7 +216,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, pages]);
 
-  const sorted = [...items].sort((a, b) => {
+  const sorted = [...visibleByTags(items, filterOn)].sort((a, b) => {
     if (sort === "最热") return (b.hot || 0) - (a.hot || 0);
     if (sort === "高分") return (b.score || 0) - (a.score || 0);
     return 0; // 「最新」保持上游按上架时间返回的顺序
@@ -228,7 +230,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
           <span className="w-[40px] h-[40px] rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center"><IGrid size={21} strokeWidth={1.9} /></span>
           <div className="flex-1 min-w-0">
             <div className="text-[17px] font-bold text-on leading-tight">{name}</div>
-            <div className="text-[10.5px] text-mut">共 {items.length} 部 · 已加载 {page}/{Math.max(pages, 1)} 页</div>
+            <div className="text-[10.5px] text-mut">共 {sorted.length} 部 · 已加载 {page}/{Math.max(pages, 1)} 页</div>
           </div>
         </div>
         <div className="px-4 pb-3 flex gap-2">

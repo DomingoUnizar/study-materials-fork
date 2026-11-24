@@ -3,8 +3,17 @@ import { api, APP_VERSION, hostOf, logLine, platform, type UpdateInfo } from "..
 import { useStore } from "../store";
 import { Modal, Toggle } from "../components/ui";
 import LinePicker from "../components/LinePicker";
-import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, usePlaybackLog } from "../playbackDiagnostics";
-import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun, IVolMute } from "../icons";
+import { copyPlaybackLog, exportPlaybackLog, initPlaybackLog, setPlaybackLog, usePlaybackLog } from "../playbackDiagnostics";
+import { hevcStatus, hevcVerified, setHevcEnabled } from "../hevc";
+import { setTagFilter, useTagFilter } from "../contentFilter";
+import { IBack, IBoltF, IBroom, IChevR, IClapper, IDownload, IEyeOff, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun, IVolMute } from "../icons";
+
+const HEVC_TEXT = {
+  unsupported: "本机不支持 HEVC 解码，一直播放 H.264",
+  on: "优先播放 HEVC（H.265），体积约为 H.264 的一半；出错会自动换回 H.264",
+  off: "已关闭，只播放 H.264",
+  auto_off: "本机播放 HEVC 时解码出错，已自动改为 H.264；打开可以再试一次",
+} as const;
 
 /* 独立设置页：线路 / 外观 / 播放 / 本地数据 / 清理缓存 / 网络诊断 / 关于
    入口：Windows 侧栏「设置」、Android「我的」右上角齿轮 */
@@ -19,6 +28,10 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const playbackLog = usePlaybackLog();
   const [copyingLog, setCopyingLog] = useState(false);
+  const [exportingLog, setExportingLog] = useState(false);
+  const [savedLog, setSavedLog] = useState("");
+  const [hevc, setHevc] = useState(hevcStatus);
+  const tagFilter = useTagFilter();
 
   const readLine = () => {
     api.lineState().then((s) => setLineBase(s.base)).catch(() => {});
@@ -58,7 +71,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
                 <span className="w-9 h-9 rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center"><ISettings size={20} strokeWidth={1.7} /></span>
                 <span className="text-[24px] font-bold tracking-wide text-on">设置</span>
               </div>
-              <div className="text-[11px] text-mut mt-1">外观 · 播放 · 本地数据 · 诊断</div>
+              <div className="text-[11px] text-mut mt-1">外观 · 播放 · 内容 · 本地数据 · 诊断</div>
             </div>
           </div>
         </div>
@@ -85,6 +98,34 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
                 <div className="text-[10.5px] text-mut">默认开启，每次启动均静音；关闭后记住上次静音状态。下次启动生效。</div>
               </div>
               <Toggle on={muteOnStartup} onChange={setMuteOnStartup} label="启动时静音" />
+            </div>
+            {platform === "android" && (
+              <div className="flex items-center gap-3 px-3.5 py-3">
+                <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IClapper size={16} /></span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[12.5px] text-on">HEVC 省流播放</div>
+                  <div className="text-[10.5px] text-mut">
+                    {HEVC_TEXT[hevc]}{hevc === "on" && (hevcVerified() ? "。本机已正常播放过 HEVC" : "。本机还没播放过 HEVC")}
+                  </div>
+                </div>
+                <Toggle on={hevc === "on"} disabled={hevc === "unsupported"} label="HEVC 省流播放"
+                  onChange={(on) => {
+                    setHevcEnabled(on);
+                    setHevc(hevcStatus());
+                    toast(on ? "已开启 HEVC 省流播放，下一个视频生效" : "已改为只播放 H.264，下一个视频生效", "ok");
+                  }} />
+              </div>
+            )}
+          </Section>
+
+          <Section title="内容">
+            <div className="flex items-center gap-3 px-3.5 py-3">
+              <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IEyeOff size={16} /></span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[12.5px] text-on">屏蔽男同内容</div>
+                <div className="text-[10.5px] text-mut">隐藏上游标了「男同」「耽美」的剧（首页、分类、搜索、排行）；收藏和观看历史不受影响</div>
+              </div>
+              <Toggle on={tagFilter} onChange={setTagFilter} label="屏蔽男同内容" />
             </div>
           </Section>
 
@@ -169,7 +210,10 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
             </div>
             <button disabled={!playbackLog.ready || playbackLog.pending || copyingLog} onClick={async () => {
               setCopyingLog(true);
-              try { await copyPlaybackLog(); toast("播放诊断日志已复制", "ok"); }
+              try {
+                const r = await copyPlaybackLog();
+                toast(r.copied < r.total ? `已复制最近 ${Math.round(r.copied / 1024)}KB 诊断日志` : "播放诊断日志已复制", "ok");
+              }
               catch (e) { toast((e as Error).message || "复制日志失败", "info"); }
               finally { setCopyingLog(false); }
             }} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable disabled:opacity-60">
@@ -177,6 +221,22 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <div className="flex-1 min-w-0">
                 <div className="text-[12.5px] text-on">{copyingLog ? "正在复制…" : "复制播放诊断日志"}</div>
                 <div className="text-[10.5px] text-mut break-all">{playbackLog.path || "日志仅保存在本机"}</div>
+              </div>
+              <IChevR size={15} className="text-mut" />
+            </button>
+            {/* 大段文字经剪贴板同步、聊天软件转发常被截断；存成文件再用微信/QQ 发文件或数据线传 */}
+            <button disabled={!playbackLog.ready || playbackLog.pending || exportingLog} onClick={async () => {
+              setExportingLog(true);
+              try { setSavedLog(await exportPlaybackLog()); toast("诊断日志已保存为文件", "ok"); }
+              catch (e) { toast((e as Error).message || "保存日志失败", "info"); }
+              finally { setExportingLog(false); }
+            }} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable disabled:opacity-60">
+              <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IDownload size={16} /></span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[12.5px] text-on">{exportingLog ? "正在保存…" : "保存诊断日志为文件"}</div>
+                <div className="text-[10.5px] text-mut break-all">
+                  {savedLog ? `已保存到 ${savedLog}` : "存到手机「下载」文件夹，可用微信 / QQ 发文件或数据线传到电脑"}
+                </div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
