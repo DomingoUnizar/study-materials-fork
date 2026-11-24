@@ -35,3 +35,5 @@ docs/API.md
 
 # Agent instructions (local)
 AGENTS.md
+# 本地产物（Android APK 等）
+artifacts/
