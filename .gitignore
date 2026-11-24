@@ -8,6 +8,10 @@ dist-ssr/
 test-results/
 src-tauri/target/
 src-tauri/gen/
+# 本地 Rust 工具链（沙箱内安装，便于在 workspace 里编译）
+.toolchain/
+# 本地构建临时目录（link.exe / esbuild 需要可写的 TEMP）
+.tmp/
 *.local
 
 # 编辑器 / 系统

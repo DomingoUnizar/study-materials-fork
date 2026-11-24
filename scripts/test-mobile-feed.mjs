@@ -174,6 +174,33 @@ try {
   await page.getByText("没有下一集啦", { exact: true }).waitFor({ state: "visible" });
   report.passed.push("Episode mode: sliding on from the last episode says there is no next episode");
 
+  // Back from the background the video layer often stays white on Android while playback goes on; the player
+  // swaps in a new video element (same address, no new play request). A blink shorter than 0.8 s keeps it.
+  await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await page.evaluate(() => window.apiLoadingFixture.complete("api_feed", "", "item"));
+  await page.locator("section video").waitFor({ state: "attached" });
+  const background = ms => page.evaluate(async away => {
+    window.__vis = "hidden";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => window.__vis });
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => window.__vis === "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await new Promise(r => setTimeout(r, away));
+    window.__vis = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, ms);
+  const markVideo = () => page.evaluate(() => { document.querySelector("section video").__before = true; });
+  const sameVideo = () => page.evaluate(() => document.querySelector("section video")?.__before === true);
+  const playsBefore = (await plays()).length;
+  await markVideo();
+  await background(200);
+  await page.waitForTimeout(300);
+  assert(await sameVideo(), "A blink shorter than 0.8 s keeps the video element");
+  await background(1000);
+  await page.waitForFunction(() => { const v = document.querySelector("section video"); return v && v.__before !== true; });
+  assert.equal((await plays()).length, playsBefore, "Rebuilding the player reuses the play address");
+  report.passed.push("Back from the background: the player swaps in a new video element with the same address (not after a sub-second blink)");
+
   // Offline cache: a cached episode plays from local files; online playback pauses downloads; the
   // cache sheet queues only episodes that are neither cached nor downloading.
   const offlineCalls = () => page.evaluate(() => window.apiLoadingFixture.feedCalls.filter(r => r.cmd.startsWith("offline_")).map(r => ({ cmd: r.cmd, args: r.args })));

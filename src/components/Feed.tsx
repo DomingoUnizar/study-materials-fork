@@ -456,9 +456,41 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setPlayTry((n) => n + 1);
   };
 
+  /* 切后台再回来时换一个新的 video 元素接着播。安卓上回到前台后视频这一层常常画不出来（白屏）：
+     诊断日志里脚本和播放都在继续、播放时间照走，离开这一页再重进才恢复。这里自动做同样的事，
+     从原位置接着播；切后台前在播的继续播，自己暂停的保持暂停。 */
+  const [surfaceGen, setSurfaceGen] = useState(0);
+  const [startPaused, setStartPaused] = useState(false);
+  const resumeState = useRef({ active, playUrl, playKey, time, paused });
+  resumeState.current = { active, playUrl, playKey, time, paused };
+  useEffect(() => {
+    if (isDesktop) return undefined;
+    let hiddenAt = 0;
+    let wasPlaying = false;
+    const onVisibility = () => {
+      const s = resumeState.current;
+      if (document.visibilityState === "hidden") {
+        // 播放器自己的暂停事件此时还没回到 React，s.paused 仍是切后台前的状态
+        hiddenAt = Date.now();
+        wasPlaying = !s.paused;
+        return;
+      }
+      const away = hiddenAt ? Date.now() - hiddenAt : 0;
+      hiddenAt = 0;
+      if (away < 800 || !s.active || !s.playUrl) return;
+      const t = videoRef.current?.el()?.currentTime || s.time;
+      if (t > 1) resumeRef.current = { key: s.playKey, t };
+      setStartPaused(!wasPlaying);
+      setSurfaceGen((n) => n + 1);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [isDesktop]);
+
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
+    setStartPaused(false);
     setVsize({ w: 0, h: 0 });
     setPortraitFit("contain");
     setZoom({ scale: 1, x: 0, y: 0, gesturing: false });
@@ -925,10 +957,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     onPointerCancel={(e) => onUp(e, true)}
                     onLostPointerCapture={(e) => onUp(e, true)}>
                     <VideoSurface
+                      key={surfaceGen}
                       ref={videoRef}
                       src={playUrl}
                       poster={fs ? undefined : posterUrl}
-                      autoPlay
+                      autoPlay={!startPaused}
                       active={active}
                       diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
                       muted={muted}

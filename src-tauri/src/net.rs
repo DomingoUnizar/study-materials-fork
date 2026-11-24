@@ -1,7 +1,8 @@
 //! 网络层：与上游站点对话。
 //!
-//! 站点把全部 `/api/**` 调用收敛成 `POST /api/edge/request` 的信封，
-//! 我们只实现这一个入口，其余接口都是「填 path」。
+//! 业务接口全部走加密通道 `dx150-edge-v1`（四个 `/api/{public,dynamic,playback,user}/request`，
+//! 实现见 [`crate::edge`]）。本文件只负责 HTTP 传输：DNS 固定、代理、超时、重定向与错误文案。
+//! 旧的明文信封 `POST /api/edge/request` 已被上游停用（固定回 `503 接口已停用`）。
 //!
 //! # 代理（用户反馈「浏览器能开、HGhub 打不开」的根因就在这里）
 //!
@@ -20,8 +21,6 @@
 //! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
 
 use crate::network_policy;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -244,6 +243,45 @@ pub async fn get(
     .map_err(|_| "请求超时".to_string())?
 }
 
+/// 加密通道的 JSON POST：沿用 DNS 固定、代理与超时策略，且**不跟随重定向**
+/// （上游四个 `/api/*/request` 都是终态，重定向只会是劫持或配置错误）。
+///
+/// 绝不主动加 `Origin` 头：站点会把带跨站 Origin 的请求直接判为
+/// `403 {"error":"origin_denied"}`。
+pub(crate) async fn post_json(
+    raw: &str,
+    referer: &str,
+    body: &Value,
+) -> Result<(u16, String, &'static str), String> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let target = network_policy::parse_target(raw)?;
+        let (target, client) = client_for(target.as_str()).await?;
+        let response = client
+            .post(target)
+            .header("Accept", "application/json")
+            .header("Referer", referer)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| err_text(&error))?;
+        let status = response.status().as_u16();
+        if response.status().is_redirection() {
+            return Err("加密接口不允许重定向".to_string());
+        }
+        let gateway = if response.headers().contains_key("cf-ray") {
+            "cloudflare"
+        } else if response.headers().contains_key("x-amz-cf-id") {
+            "cloudfront"
+        } else {
+            "other"
+        };
+        let text = response.text().await.map_err(|error| err_text(&error))?;
+        Ok((status, text, gateway))
+    })
+    .await
+    .map_err(|_| "请求超时".to_string())?
+}
+
 /// 只返回代理的协议/主机/端口；解析失败时隐藏整个值，绝不回传认证或查询参数。
 pub fn redact_proxy(raw: &str) -> String {
     let parsed = url::Url::parse(raw.trim())
@@ -362,11 +400,16 @@ pub async fn diagnose() -> Value {
         }),
     };
 
+    // 首页 200 不代表业务接口可用：加密通道握手成功才说明这条线路真的能用
+    // （2026-11 上游停用旧信封时，所有线路首页都是 200、接口全是 503）。
+    let edge = crate::edge::probe(&cur).await;
+
     json!({
         "base": cur,
         "host": host,
         "dns": dns,
         "http": http,
+        "edge": edge,
         "env": {
             "HTTP_PROXY": std::env::var("HTTP_PROXY").ok().map(|p| redact_proxy(&p)),
             "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok().map(|p| redact_proxy(&p)),
@@ -381,10 +424,19 @@ fn retryable_error(error: &str) -> bool {
     if error == "401" {
         return false;
     }
+    // 上游明确的终态（旧信封停用、跨站拒绝）：重试只会放大日志噪音。
+    if error.contains("接口已停用") || error.contains("origin_denied") {
+        return false;
+    }
     if let Some(status) = error
         .strip_prefix("HTTP ")
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| s.parse::<u16>().ok())
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u16>()
+                .ok()
+        })
     {
         return matches!(status, 408 | 425 | 429 | 500..=599);
     }
@@ -451,20 +503,219 @@ fn edge_operation(path: &str) -> &'static str {
     }
 }
 
-/// 仅无请求体、无凭据的逻辑 GET 可以迁移网关；信封本身仍使用 POST。
-fn edge_redirect_target(
-    current: &url::Url,
-    status: u16,
-    location: &str,
-    guest_get: bool,
-) -> Result<url::Url, String> {
-    if !guest_get || !matches!(status, 301 | 302 | 303) {
-        return Err("业务接口重定向已拒绝".into());
-    }
-    network_policy::redirect_target(current, location)
+/* ───────────────────────── 统一传输层 ───────────────────────── */
+
+/// 传输失败的分类：界面与日志据此区分「业务失败」「没有权限」和「协议变了」。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApiErrorKind {
+    Business,
+    Permission,
+    Protocol,
+    Network,
 }
 
-/// 业务请求：走边缘信封。
+impl ApiErrorKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ApiErrorKind::Business => "business",
+            ApiErrorKind::Permission => "permission",
+            ApiErrorKind::Protocol => "protocol",
+            ApiErrorKind::Network => "network",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ApiError {
+    kind: ApiErrorKind,
+    message: String,
+}
+
+impl ApiError {
+    fn new(kind: ApiErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn business(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::Business, message)
+    }
+
+    fn permission(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::Permission, message)
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::Protocol, message)
+    }
+
+    fn network(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::Network, message)
+    }
+
+    /// 只有协议级失败才换通道：业务失败换通道结果一样，网络失败换通道只会放大请求。
+    fn should_fallback(&self) -> bool {
+        matches!(self.kind, ApiErrorKind::Protocol)
+    }
+}
+
+/// 明文 REST 是否优先。依据 2026-11-24 实测：
+/// 公开读、详情、搜索、播放地址、登录/注册都可用；
+/// 身份读取（`/api/account/me`、`/api/users/me/*`）用 Bearer 直连返回 401，
+/// 写操作仍交给加密通道，避免同一个写请求在两套通道上出现不同的幂等语义。
+fn rest_preferred(method: &str, path: &str) -> bool {
+    let method = method.to_ascii_uppercase();
+    let path = path.split('?').next().unwrap_or(path);
+    if matches!(
+        path,
+        "/api/account/loginByPassword" | "/api/account/registerByPassword"
+    ) {
+        return true;
+    }
+    if path.starts_with("/api/account/") || path.starts_with("/api/users/me/") {
+        return false;
+    }
+    match method.as_str() {
+        "GET" | "HEAD" => true,
+        // 取播放地址的 POST 没有副作用
+        "POST" => path.ends_with("/playback"),
+        _ => false,
+    }
+}
+
+/// 把明文 REST 的响应分成：成功数据 / 业务失败 / 权限失败 / 协议失败。
+/// 只有「协议失败」才值得再走一次加密通道（业务和权限错误换通道也没用）。
+fn classify_rest(status: u16, text: &str) -> Result<Value, ApiError> {
+    let parsed = serde_json::from_str::<Value>(text).ok();
+    if let Some(parsed) = parsed.as_ref() {
+        if let Some(business_status) = parsed.get("status").and_then(Value::as_i64) {
+            if business_status == 1 {
+                return Ok(parsed.get("data").cloned().unwrap_or(Value::Null));
+            }
+            if status == 401 || status == 403 {
+                return Err(ApiError::permission("401"));
+            }
+            let message = parsed
+                .get("msg")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("接口返回失败");
+            return Err(ApiError::business(message));
+        }
+        if let Some(error) = parsed.get("error").and_then(Value::as_str) {
+            return Err(ApiError::protocol(format!("HTTP {status}: {error}")));
+        }
+    }
+    if status == 401 || status == 403 {
+        return Err(ApiError::permission("401"));
+    }
+    if status >= 500 {
+        return Err(ApiError::network(format!("HTTP {status}")));
+    }
+    Err(ApiError::protocol(format!("HTTP {status}")))
+}
+
+/// 明文 REST 请求：复用同一套 DNS 固定 / 代理 / TLS 策略，绝不主动加 `Origin`。
+async fn rest_call(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> Result<Value, ApiError> {
+    let url = format!("{origin}{path}");
+    let (target, client) = client_for(&url)
+        .await
+        .map_err(|error| ApiError::network(error))?;
+    let mut request = match method.to_ascii_uppercase().as_str() {
+        "GET" => client.get(target),
+        "HEAD" => client.head(target),
+        "POST" => client.post(target),
+        "PUT" => client.put(target),
+        "PATCH" => client.patch(target),
+        "DELETE" => client.delete(target),
+        other => return Err(ApiError::protocol(format!("不支持的请求方法：{other}"))),
+    };
+    request = request
+        .header("Accept", "application/json")
+        .header("Referer", format!("{origin}/"));
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ApiError::network(err_text(&error)))?;
+    if response.status().is_redirection() {
+        // 业务接口都是终态，重定向只会是劫持或配置错误。
+        return Err(ApiError::protocol("明文接口不允许重定向"));
+    }
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| ApiError::network(err_text(&error)))?;
+    classify_rest(status, &text)
+}
+
+/// 加密通道的错误是字符串（`401` / `HTTP 5xx` / 握手与信封错误），按语义重新归类。
+fn classify_encrypted_error(error: &str) -> ApiError {
+    if error == "401" {
+        return ApiError::permission("401");
+    }
+    if let Some(status) = error
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u16>().ok())
+    {
+        return if matches!(status, 408 | 425 | 429) || status >= 500 {
+            ApiError::network(error.to_string())
+        } else {
+            ApiError::protocol(error.to_string())
+        };
+    }
+    if error.contains("加密") {
+        ApiError::protocol(error.to_string())
+    } else {
+        ApiError::network(error.to_string())
+    }
+}
+
+fn unwrap_business(value: Value) -> Result<Value, ApiError> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if value.get("status").and_then(Value::as_i64) == Some(1) {
+        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+    }
+    Err(ApiError::business(
+        value
+            .get("msg")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("接口返回失败"),
+    ))
+}
+
+async fn encrypted_call(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> Result<Value, ApiError> {
+    let (value, _status) = crate::edge::call(origin, method, path, body, token)
+        .await
+        .map_err(|error| classify_encrypted_error(&error))?;
+    unwrap_business(value)
+}
+
+/// 业务请求：统一传输层。明文 REST 可用时优先，协议级失败再自动落到加密通道
+/// （`dx150-edge-v1`，见 [`crate::edge`]）。写操作只提交一次，不因重试重复落库。
 pub async fn edge(
     origin: &str,
     method: &str,
@@ -483,134 +734,91 @@ pub async fn edge(
     {
         return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
     }
-    let (encoded, ctype) = match &body {
-        Some(v) => (
-            B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
-            "application/json",
-        ),
-        None => (String::new(), ""),
+    let operation = edge_operation(path);
+    let line_host = url::Url::parse(&cur)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    // 取播放地址的 POST 没有副作用，和 GET 一样允许重试；
+    // 其余带请求体的写操作（点赞 / 评论 / 收藏）只尝试一次，避免重复提交。
+    let can_retry = (method.eq_ignore_ascii_case("GET") && body.is_none())
+        || (method.eq_ignore_ascii_case("POST") && operation == "play");
+    let preferred = if rest_preferred(method, path) {
+        "rest"
+    } else {
+        crate::edge::PROTOCOL
     };
-    let envelope = json!({
-        "method": method,
-        "path": path,
-        "body": encoded,
-        "content_type": ctype,
-    });
-
-    let url = format!("{cur}/api/edge/request");
-    let referer = format!("{cur}/");
-    let token = token.map(|s| s.to_string());
 
     static NEXT_EDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_EDGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let line_host = url::Url::parse(&cur)
-        .unwrap()
-        .host_str()
-        .unwrap()
-        .to_string();
-    let operation = edge_operation(path);
-    let mut attempt = 0;
-    let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
-    // 取播放地址的 POST 没有副作用，和 GET 一样允许重试
-    let can_retry = (method.eq_ignore_ascii_case("GET") && body.is_none())
-        || (method.eq_ignore_ascii_case("POST") && operation == "play");
-    let value = with_retry(can_retry, || {
+    let mut attempt = 0u32;
+    let (value, _transport) = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
-        let envelope = envelope.clone();
-        let token = token.clone();
-        let url = url.clone();
-        let referer = referer.clone();
+        let cur = cur.clone();
         let line_host = line_host.clone();
+        let body = body.clone();
+        let token = token.map(str::to_owned);
         async move {
             let started = Instant::now();
-            crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method, "line_host": line_host}));
-            let mut status_code = None;
-            let mut headers_ms = None;
-            let mut target_host = line_host.clone();
-            let mut response_kind = "unknown";
-            let mut gateway = "other";
-            let result = async {
-                let mut next = network_policy::parse_target(&url)?;
-                for hop in 0..=5 {
-                    let (target, client) = client_for(next.as_str()).await?;
-                    target_host = target.host_str().unwrap_or("").to_string();
-                    let mut req = client
-                        .post(target.clone())
-                        .header("Accept", "application/json")
-                        .header("Referer", &referer)
-                        .json(&envelope);
-                    if let Some(t) = token.as_deref() {
-                        if !t.is_empty() {
-                            req = req.header("Authorization", format!("Bearer {t}"));
-                        }
+            crate::playback_log::record(
+                "api.begin",
+                json!({
+                    "request": request, "attempt": attempt, "operation": operation,
+                    "method": method, "line_host": line_host, "transport": preferred,
+                }),
+            );
+            let result: Result<(Value, &'static str), ApiError> = if preferred == "rest" {
+                match rest_call(&cur, method, path, body.as_ref(), token.as_deref()).await {
+                    Ok(value) => Ok((value, "rest")),
+                    // 协议级失败（路径不在明文接口里、响应不是业务信封）才换加密通道；
+                    // 业务/权限错误换通道也一样，直接返回。
+                    Err(error) if error.should_fallback() => {
+                        crate::playback_log::record(
+                            "transport.fallback",
+                            json!({
+                                "request": request, "attempt": attempt,
+                                "from": "rest", "to": crate::edge::PROTOCOL,
+                                "kind": error.kind.as_str(),
+                            }),
+                        );
+                        encrypted_call(&cur, method, path, body.as_ref(), token.as_deref())
+                            .await
+                            .map(|value| (value, crate::edge::PROTOCOL))
                     }
-                    let resp = req.send().await.map_err(|e| err_text(&e))?;
-                    let status = resp.status();
-                    status_code = Some(status.as_u16());
-                    headers_ms = Some(started.elapsed().as_millis() as u64);
-                    let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-                    response_kind = if ctype.contains("json") { "json" } else if ctype.contains("html") { "html" } else { "other" };
-                    gateway = if resp.headers().contains_key("x-amz-cf-id") { "cloudfront" } else if resp.headers().contains_key("cf-ray") { "cloudflare" } else { "other" };
-                    // 逐跳重建并检查客户端；不自动把信封 POST 改成无信封 GET。
-                    if status.is_redirection() {
-                        if hop == 5 {
-                            return Err("重定向次数超过限制".into());
-                        }
-                        let location = resp
-                            .headers()
-                            .get(reqwest::header::LOCATION)
-                            .and_then(|h| h.to_str().ok())
-                            .ok_or("重定向缺少有效 Location")?;
-                        next = edge_redirect_target(&target, status.as_u16(), location, guest_get)?;
-                        continue;
-                    }
-                    let text = resp.text().await.map_err(|e| err_text(&e))?;
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
-                        return Err("401".to_string());
-                    }
-                    if !status.is_success() {
-                        return Err(format!(
-                            "HTTP {status}: {}",
-                            text.chars().take(160).collect::<String>()
-                        ));
-                    }
-                    if text.trim().is_empty() {
-                        return Ok(Value::Null);
-                    }
-                    return serde_json::from_str::<Value>(&text)
-                        .map_err(|e| format!("{e}: {}", text.chars().take(160).collect::<String>()));
+                    Err(error) => Err(error),
                 }
-                Err("重定向次数超过限制".into())
-            }.await;
-            crate::playback_log::record("api.end", json!({
-                "request": request, "attempt": attempt, "operation": operation, "method": method,
-                "line_host": line_host, "target_host": target_host, "status": status_code,
-                "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
-                "response_kind": response_kind, "gateway": gateway,
-                "business_status": result.as_ref().ok().and_then(|v: &Value| v.get("status")).and_then(Value::as_i64),
-                "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e)),
-                "retryable": can_retry && result.as_ref().err().is_some_and(|e| retryable_error(e)),
-            }));
-            result
+            } else {
+                encrypted_call(&cur, method, path, body.as_ref(), token.as_deref())
+                    .await
+                    .map(|value| (value, crate::edge::PROTOCOL))
+            };
+            let mut event = json!({
+                "request": request, "attempt": attempt, "operation": operation,
+                "method": method, "line_host": line_host,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            });
+            match &result {
+                Ok((_, used)) => {
+                    event["transport"] = json!(used);
+                    event["ok"] = json!(true);
+                    event["retryable"] = json!(false);
+                }
+                Err(error) => {
+                    event["transport"] = json!(preferred);
+                    event["api_error_kind"] = json!(error.kind.as_str());
+                    event["error_kind"] = json!(crate::playback_log::error_kind(&error.message));
+                    event["retryable"] =
+                        json!(can_retry && retryable_error(&error.message));
+                }
+            }
+            crate::playback_log::record("api.end", event);
+            result.map_err(|error| error.message)
         }
     })
     .await?;
 
-    if value.is_null() {
-        return Ok(Value::Null);
-    }
-
-    if value.get("status").and_then(|v| v.as_i64()) == Some(1) {
-        Ok(value.get("data").cloned().unwrap_or(Value::Null))
-    } else {
-        Err(value
-            .get("msg")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("接口返回失败")
-            .to_string())
-    }
+    Ok(value)
 }
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
@@ -766,31 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn edge_redirects_only_replay_anonymous_reads() {
-        let current = url::Url::parse("https://huangguoai.ai/api/edge/request").unwrap();
-        assert_eq!(
-            edge_redirect_target(
-                &current,
-                301,
-                "https://huangguoai.com/api/edge/request",
-                true
-            )
-            .unwrap()
-            .host_str(),
-            Some("huangguoai.com")
-        );
-        assert!(edge_redirect_target(&current, 302, "/next", true).is_ok());
-        for status in [301, 302, 303, 307, 308] {
-            assert!(edge_redirect_target(&current, status, "/next", false).is_err());
-        }
-        for status in [307, 308] {
-            assert!(edge_redirect_target(&current, status, "/next", true).is_err());
-        }
-        assert!(edge_redirect_target(&current, 301, "http://example.com/", true).is_err());
-        assert!(edge_redirect_target(&current, 301, "https://127.0.0.1/", true).is_err());
-    }
-
-    #[test]
     fn proxy_credentials_and_query_are_redacted() {
         assert_eq!(
             redact_proxy("http://alice:p%40ss@127.0.0.1:7897/path?token=secret#hidden"),
@@ -860,6 +1043,213 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("禁止访问"));
+    }
+
+    #[test]
+    fn rest_first_covers_reads_playback_and_login_only() {
+        for (method, path) in [
+            ("GET", "/api/videos?page=1&size=20"),
+            ("GET", "/api/videos/10586"),
+            ("GET", "/api/home"),
+            ("GET", "/api/search?q=abc"),
+            ("POST", "/api/videos/10586/episodes/1/playback"),
+            ("POST", "/api/posts/117/playback"),
+            ("POST", "/api/account/loginByPassword"),
+            ("POST", "/api/account/registerByPassword"),
+        ] {
+            assert!(rest_preferred(method, path), "{method} {path}");
+        }
+        // 身份读取与写操作留在加密通道
+        for (method, path) in [
+            ("GET", "/api/account/me"),
+            ("GET", "/api/users/me/history?page=1"),
+            ("POST", "/api/videos/10586/like"),
+            ("POST", "/api/videos/10586/comments"),
+            ("DELETE", "/api/videos/10586/collect"),
+        ] {
+            assert!(!rest_preferred(method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn rest_responses_are_split_into_business_permission_and_protocol() {
+        assert_eq!(
+            classify_rest(200, r#"{"status":1,"data":{"items":[]}}"#).unwrap(),
+            json!({"items": []})
+        );
+        let business = classify_rest(200, r#"{"status":0,"msg":"账号或密码错误"}"#).unwrap_err();
+        assert_eq!(business.kind, ApiErrorKind::Business);
+        assert_eq!(business.message, "账号或密码错误");
+        let denied = classify_rest(401, r#"{"status":0,"msg":"unauthorized"}"#).unwrap_err();
+        assert_eq!(denied.kind, ApiErrorKind::Permission);
+        // 只有协议级失败才值得再走一次加密通道
+        let protocol = classify_rest(400, r#"{"error":"invalid_request"}"#).unwrap_err();
+        assert_eq!(protocol.kind, ApiErrorKind::Protocol);
+        assert_eq!(
+            classify_rest(404, "<html>not found</html>").unwrap_err().kind,
+            ApiErrorKind::Protocol
+        );
+        assert_eq!(
+            classify_rest(503, "").unwrap_err().kind,
+            ApiErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn only_protocol_failures_switch_channel() {
+        assert!(ApiError::protocol("HTTP 404").should_fallback());
+        assert!(!ApiError::permission("401").should_fallback());
+        assert!(!ApiError::business("账号或密码错误").should_fallback());
+        assert!(!ApiError::network("请求超时").should_fallback());
+    }
+
+    #[test]
+    fn encrypted_errors_keep_permission_protocol_and_network_apart() {
+        assert_eq!(
+            classify_encrypted_error("401").kind,
+            ApiErrorKind::Permission
+        );
+        assert_eq!(
+            classify_encrypted_error("HTTP 400: invalid_request").kind,
+            ApiErrorKind::Protocol
+        );
+        assert_eq!(
+            classify_encrypted_error("加密接口响应不匹配").kind,
+            ApiErrorKind::Protocol
+        );
+        assert_eq!(
+            classify_encrypted_error("HTTP 503: 接口已停用").kind,
+            ApiErrorKind::Network
+        );
+        assert_eq!(
+            classify_encrypted_error("请求超时").kind,
+            ApiErrorKind::Network
+        );
+    }
+
+    /// 手动跑：`set HGHUB_TEST_USER=... HGHUB_TEST_PASS=... && cargo test --lib -- --ignored net::tests::live_rest_coverage -- --nocapture`
+    /// 走 App 自己的登录接口拿会话，再逐条对比明文 REST 与加密通道的实际结果。
+    #[tokio::test]
+    #[ignore = "联网测试：需要 HGHUB_TEST_USER / HGHUB_TEST_PASS，手动用 --ignored 运行"]
+    async fn live_rest_coverage() {
+        let (Ok(user), Ok(pass)) = (
+            std::env::var("HGHUB_TEST_USER"),
+            std::env::var("HGHUB_TEST_PASS"),
+        ) else {
+            println!("跳过：缺少 HGHUB_TEST_USER / HGHUB_TEST_PASS");
+            return;
+        };
+        let origin = DEFAULT_BASE;
+        let login = edge(
+            origin,
+            "POST",
+            "/api/account/loginByPassword",
+            Some(json!({"username": user, "password": pass})),
+            None,
+        )
+        .await
+        .expect("登录失败");
+        let token = login
+            .get("token")
+            .and_then(Value::as_str)
+            .expect("登录返回缺少 token")
+            .to_string();
+        println!("登录成功：token 长度 {}", token.len());
+        for (method, path) in [
+            ("GET", "/api/videos?page=1&size=2"),
+            ("GET", "/api/videos/10586"),
+            ("GET", "/api/home"),
+            ("GET", "/api/search?q=test"),
+            ("POST", "/api/videos/10586/episodes/1/playback"),
+            ("GET", "/api/account/me"),
+            ("GET", "/api/users/me/history?page=1"),
+        ] {
+            let payload = json!({});
+            let body = if method == "POST" { Some(&payload) } else { None };
+            let rest = rest_call(origin, method, path, body, Some(&token)).await;
+            let enc = encrypted_call(origin, method, path, body, Some(&token)).await;
+            println!(
+                "{method:6} {path:44} rest={:28} edge={:?}",
+                match &rest {
+                    Ok(_) => "ok".to_string(),
+                    Err(error) => format!("{}:{}", error.kind.as_str(), error.message),
+                },
+                match &enc {
+                    Ok(_) => "ok".to_string(),
+                    Err(error) => format!("{}:{}", error.kind.as_str(), error.message),
+                }
+            );
+        }
+    }
+
+    /// 手动跑：`set HGHUB_TEST_USER=... HGHUB_TEST_PASS=... && cargo test --lib -- --ignored net::tests::live_app_flow -- --nocapture`
+    /// 走统一传输层把 App 的主要业务链路跑一遍（登录 → 列表 → 详情 → 播放地址 → 我的 → 点赞/取消）。
+    #[tokio::test]
+    #[ignore = "联网测试：需要 HGHUB_TEST_USER / HGHUB_TEST_PASS，手动用 --ignored 运行"]
+    async fn live_app_flow() {
+        let (Ok(user), Ok(pass)) = (
+            std::env::var("HGHUB_TEST_USER"),
+            std::env::var("HGHUB_TEST_PASS"),
+        ) else {
+            println!("跳过：缺少 HGHUB_TEST_USER / HGHUB_TEST_PASS");
+            return;
+        };
+        let origin = DEFAULT_BASE;
+        let login = edge(
+            origin,
+            "POST",
+            "/api/account/loginByPassword",
+            Some(json!({"username": user, "password": pass})),
+            None,
+        )
+        .await
+        .expect("登录失败");
+        let token = login["token"].as_str().expect("缺少 token").to_string();
+        let feed = edge(origin, "GET", "/api/videos?page=1&size=3", None, Some(&token))
+            .await
+            .expect("列表失败");
+        let first = feed["items"][0]["id"].as_i64().expect("列表为空");
+        let detail = edge(origin, "GET", &format!("/api/videos/{first}"), None, Some(&token))
+            .await
+            .expect("详情失败");
+        let play = edge(
+            origin,
+            "POST",
+            &format!("/api/videos/{first}/episodes/1/playback"),
+            Some(json!({})),
+            Some(&token),
+        )
+        .await
+        .expect("播放地址失败");
+        let me = edge(origin, "GET", "/api/account/me", None, Some(&token))
+            .await
+            .expect("我的失败");
+        let liked = edge(
+            origin,
+            "POST",
+            &format!("/api/videos/{first}/like"),
+            Some(json!({})),
+            Some(&token),
+        )
+        .await
+        .expect("点赞失败");
+        let unliked = edge(
+            origin,
+            "DELETE",
+            &format!("/api/videos/{first}/like"),
+            None,
+            Some(&token),
+        )
+        .await
+        .expect("取消点赞失败");
+        println!(
+            "视频 {first} 标题={:?} 播放流={} 我的 id={:?} 点赞={:?} 取消={:?}",
+            detail["title"].as_str().unwrap_or(""),
+            play.get("streams").is_some(),
+            me.get("id"),
+            liked.get("liked"),
+            unliked.get("liked"),
+        );
     }
 
     /// 手动跑：`cargo test --lib -- --ignored net::tests::diag -- --nocapture`

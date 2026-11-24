@@ -16,8 +16,6 @@ pub const FIXED: [(&str, &str); 2] = [
 const PUBLISH_PAGE: &str = "https://huangguoai.pages.dev/";
 /// 镜像列表上限（子域 × 域名是笛卡尔积，界面只展示这么多）
 const MIRROR_MAX: usize = 60;
-/// 单条线路探测超时
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub fn fixed() -> Value {
     json!(FIXED
@@ -87,22 +85,20 @@ pub async fn probe(urls: Vec<String>) -> Value {
 }
 
 async fn probe_one(url: String) -> Value {
-    let target = format!("{}/", url.trim_end_matches('/'));
+    // 探测的是「这条线路的业务接口能不能用」，不是首页能不能打开。
+    // 2026-11 上游停用旧信封时，所有线路首页都是 200、接口全是 503 —— 只探首页等于给假绿灯。
+    let origin = url.trim_end_matches('/').to_string();
     let started = Instant::now();
-    let res = crate::net::get(
-        &target,
-        PROBE_TIMEOUT,
-        Some("text/html,application/xhtml+xml"),
-        None,
-    )
-    .await;
+    let result = crate::edge::probe(&origin).await;
     let ms = started.elapsed().as_millis() as u64;
-    match res {
-        Ok(r) => {
-            let status = r.status().as_u16();
-            json!({ "url": url, "ok": status < 400, "status": status, "ms": ms })
-        }
-        Err(e) => json!({ "url": url, "ok": false, "ms": ms, "error": e }),
+    match result.get("ok").and_then(Value::as_bool) {
+        Some(true) => json!({ "url": url, "ok": true, "status": 200, "ms": ms }),
+        _ => json!({
+            "url": url,
+            "ok": false,
+            "ms": ms,
+            "error": result.get("error").and_then(Value::as_str).unwrap_or("加密接口不可用"),
+        }),
     }
 }
 

@@ -40,6 +40,9 @@ aes = "0.8"
 base64 = "0.22"
 percent-encoding = "2"
 once_cell = "1"
+# 加密接口（dx150-edge-v1，见 src/edge.rs）用的 P-256 ECDH / HKDF-SHA256 / AES-256-GCM。
+# ring 本来就在依赖树里（rustls 0.23 的加密后端），这里只是提为直接依赖，不引入新的编译单元。
+ring = "0.17"
 url = "2"
 
 # macOS 红绿灯垂直居中需要读取 AppKit 按钮尺寸（见 src/macos_titlebar.rs）。

@@ -52,7 +52,12 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     logLine(`[api] ${cmd} → ${msg}`);
     const status = /^HTTP (\d{3})\b/.exec(msg)?.[1];
     if (status) {
-      throw new Error(`服务器请求失败（HTTP ${status}），请稍后重试或在设置中切换线路`);
+      // 上游正文里常写明真实原因（例如「接口已停用」「origin_denied」），
+      // 以前只留状态码会让界面把「接口停用」显示成「切换线路」。
+      const detail = /"msg"\s*:\s*"([^"]{1,80})"/.exec(msg)?.[1]
+        || /"error"\s*:\s*"([^"]{1,80})"/.exec(msg)?.[1]
+        || "";
+      throw new Error(`服务器请求失败（HTTP ${status}）${detail ? `：${detail}` : "，请稍后重试或在设置中切换线路"}`);
     }
     throw new Error(msg.length > 140 ? `${msg.slice(0, 140)}…` : msg);
   }
