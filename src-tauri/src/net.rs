@@ -1252,6 +1252,114 @@ mod tests {
         );
     }
 
+    /// 手动跑：`set HGHUB_TEST_USER=... HGHUB_TEST_PASS=... && cargo test --lib -- --ignored net::tests::live_encrypted_only -- --nocapture`
+    /// 只走加密通道把 App 用到的全部接口跑一遍，确认「全加密」是否可行（写操作按可逆方式做）。
+    #[tokio::test]
+    #[ignore = "联网测试：需要 HGHUB_TEST_USER / HGHUB_TEST_PASS，手动用 --ignored 运行"]
+    async fn live_encrypted_only() {
+        let (Ok(user), Ok(pass)) = (
+            std::env::var("HGHUB_TEST_USER"),
+            std::env::var("HGHUB_TEST_PASS"),
+        ) else {
+            println!("跳过：缺少 HGHUB_TEST_USER / HGHUB_TEST_PASS");
+            return;
+        };
+        let origin = DEFAULT_BASE;
+        let login = encrypted_call(
+            origin,
+            "POST",
+            "/api/account/loginByPassword",
+            Some(&json!({"username": user, "password": pass})),
+            None,
+        )
+        .await;
+        let token = login
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("token"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        println!(
+            "登录（加密通道）：{}",
+            match (&login, &token) {
+                (Ok(_), Some(token)) => format!("ok，token 长度 {}", token.len()),
+                _ => format!("失败 {:?}", login.as_ref().err().map(|e| e.message.clone())),
+            }
+        );
+        let token = token.expect("登录失败");
+        let mut failures = 0;
+        for (method, path) in [
+            ("GET", "/api/videos?page=1&size=3".to_string()),
+            ("GET", "/api/videos/category/ai-duanju?page=1&size=3".to_string()),
+            ("GET", "/api/ranks/hot".to_string()),
+            ("GET", "/api/search?q=test&page=1&size=3".to_string()),
+            ("GET", "/api/search/hot".to_string()),
+            ("GET", "/api/posts?page=1&size=3".to_string()),
+            ("GET", "/api/posts/117".to_string()),
+            ("GET", "/api/posts/117/comments?page=1".to_string()),
+            ("GET", "/api/videos/12".to_string()),
+            ("GET", "/api/videos/12/comments?ep=1".to_string()),
+            ("GET", "/api/videos/12/play?ep=1&page_texts=0".to_string()),
+            ("POST", "/api/videos/12/episodes/1/playback".to_string()),
+            ("GET", "/api/users/156291".to_string()),
+            ("GET", "/api/users/156291/stats".to_string()),
+            ("GET", "/api/site/config".to_string()),
+            ("GET", "/api/site/menus".to_string()),
+            ("GET", "/api/account/me".to_string()),
+            ("GET", "/api/users/me/history?page=1".to_string()),
+            ("GET", "/api/users/me/collects?page=1".to_string()),
+            ("GET", "/api/users/me/likes?page=1".to_string()),
+        ] {
+            let started = Instant::now();
+            let result = encrypted_call(origin, method, &path, None, Some(&token)).await;
+            let ms = started.elapsed().as_millis();
+            match &result {
+                Ok(_) => println!("{ms:5}ms ok    {method:6} {path}"),
+                Err(error) => {
+                    failures += 1;
+                    println!(
+                        "{ms:5}ms {} {method:6} {path}  ({})",
+                        error.kind.as_str(),
+                        error.message
+                    );
+                }
+            }
+        }
+        // 可逆写操作：点赞 / 收藏 / 关注，做完立刻还原
+        let payload = json!({});
+        for (label, on, off) in [
+            (
+                "点赞",
+                ("POST", "/api/videos/12/like?ep=1".to_string()),
+                ("DELETE", "/api/videos/12/like?ep=1".to_string()),
+            ),
+            (
+                "收藏",
+                ("POST", "/api/videos/12/collect".to_string()),
+                ("DELETE", "/api/videos/12/collect".to_string()),
+            ),
+            (
+                "关注",
+                ("POST", "/api/users/156291/follow".to_string()),
+                ("DELETE", "/api/users/156291/follow".to_string()),
+            ),
+        ] {
+            let started = Instant::now();
+            let a = encrypted_call(origin, on.0, &on.1, Some(&payload), Some(&token)).await;
+            let b = encrypted_call(origin, off.0, &off.1, None, Some(&token)).await;
+            println!(
+                "{:5}ms 写 {label}：{} / 还原：{}",
+                started.elapsed().as_millis(),
+                if a.is_ok() { "ok" } else { "失败" },
+                if b.is_ok() { "ok" } else { "失败" }
+            );
+            if a.is_err() || b.is_err() {
+                failures += 1;
+            }
+        }
+        println!("失败 {failures} 项");
+    }
+
     /// 手动跑：`cargo test --lib -- --ignored net::tests::diag -- --nocapture`
     /// 关掉 TUN、只留系统代理时跑一遍，能直接看出客户端有没有走代理。
     #[tokio::test]
