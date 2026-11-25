@@ -4,6 +4,7 @@ import { api } from "./api";
 /* 收藏更新提醒：只在启动后和回到前台时检查，两次检查至少隔 6 小时，不常驻、不轮询。
    上游没有按更新时间排序的列表（sort 只支持按上架时间的 new），所以每次检查给每部收藏取一次详情
    （同时最多 2 个请求），拿最新集数和「上次看到的集数」比，多出来就算有更新。
+   打开「我的收藏」时，收藏页本来就取的详情也顺带比一次，所以一打开就能看到更新，不用等定时检查。
    在信息流里看到这部剧（点开它，或刚收藏它）就算看过；第一次见到的收藏只记下当时的集数，不提醒。 */
 const SEEN_KEY = "hghub_fav_seen";
 const NEW_KEY = "hghub_fav_updates";
@@ -36,6 +37,22 @@ export function markSeen(id: number, count: number) {
   publish();
 }
 
+/** 拿到一部收藏的最新集数：第一次见到只记下；比上次看到的多就记为有更新。返回是否新发现了更新 */
+function note(id: number, count: number) {
+  if (!count) return false;
+  if (!(id in seen)) { seen = { ...seen, [id]: count }; return false; }
+  if (count <= seen[id] || updates[id] === count) return false;
+  updates = { ...updates, [id]: count };
+  return true;
+}
+
+/** 收藏页本来就要取每部收藏的详情：顺带比一下集数，有更新马上标出来（不另外请求上游，不等 6 小时的定时检查） */
+export function noteFavDetail(id: number, count: number) {
+  const before = { seen: seen[id], update: updates[id] };
+  note(id, count);
+  if (seen[id] !== before.seen || updates[id] !== before.update) publish();
+}
+
 let running = false;
 /** 检查收藏有没有更新；返回这次新发现有更新的 id */
 export async function checkFavUpdates(favs: number[], now = Date.now()): Promise<number[]> {
@@ -50,22 +67,22 @@ export async function checkFavUpdates(favs: number[], now = Date.now()): Promise
     seen = keep(seen);
     updates = keep(updates);
     const queue = [...favs];
+    let ok = 0;
+    let failed = 0;
     const worker = async () => {
       for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
+        // 一部都没取到就连着失败：多半是断网或上游出问题，不再一部部白请求
+        if (!ok && failed >= 3) return;
         try {
           const d = await api.video(id);
-          const count = d?.episode_count || d?.episodes?.length || 0;
-          if (!count) continue;
-          if (!(id in seen)) seen = { ...seen, [id]: count };
-          else if (count > seen[id] && updates[id] !== count) {
-            updates = { ...updates, [id]: count };
-            found.push(id);
-          }
-        } catch { /* 这部这次取不到，下次再查 */ }
+          ok += 1;
+          if (note(id, d?.episode_count || d?.episodes?.length || 0)) found.push(id);
+        } catch { failed += 1; /* 这部这次取不到，下次再查 */ }
       }
     };
     await Promise.all([worker(), worker()]);
-    try { localStorage.setItem(CHECKED_KEY, String(now)); } catch { /* 下次启动再查 */ }
+    // 一部都没取到的检查不算数：下次回到前台就重查，不用再等 6 小时
+    if (ok) { try { localStorage.setItem(CHECKED_KEY, String(now)); } catch { /* 下次启动再查 */ } }
     publish();
   } finally {
     running = false;

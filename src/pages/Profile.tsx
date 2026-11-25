@@ -4,12 +4,15 @@ import type { Detail } from "../types";
 import { useStore } from "../store";
 import { Avatar, Empty, Img } from "../components/ui";
 import { IChevR, IClock, IDownload, ILogout, ISettings, IStar, ITrash, IUser } from "../icons";
-import { cacheEpisodes, offlineCover, removeOffline, useOffline, type OfflineEpisode } from "../offline";
+import { cacheEpisodes, interrupted, offlineCover, removeOffline, resumeOffline, useOffline, type OfflineEpisode } from "../offline";
 import { offlineLabel } from "../components/Panels";
-import { useFavUpdates } from "../favUpdates";
+import { noteFavDetail, useFavUpdates } from "../favUpdates";
 
 /** 收藏、历史每次加载 12 条，滑到底再加载下一批，避免一次向上游请求几十条详情 */
 const PAGE = 12;
+
+/** 一部剧现有几集：以选集列表为准，没有选集时用上游给的集数 */
+const episodeCount = (d: Detail) => Math.max(d.episodes?.length || 0, d.episode_count || 0);
 
 /* 我的：结构固定（资料卡 + 我的收藏 / 观看历史）。
    收藏与观看记录都存在本地，所以未登录也照常展示；未登录时资料卡本身就是登录入口。 */
@@ -20,6 +23,8 @@ export default function Profile({ wide }: { wide: boolean }) {
   const [limit, setLimit] = useState(PAGE);
   const [loading, setLoading] = useState(0);
   const requested = useRef(new Set<number>());
+  /** 已发出、还没回来的详情请求数（同步更新，见下面翻页的 effect） */
+  const inflight = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const moreRef = useRef<HTMLDivElement>(null);
 
@@ -39,26 +44,34 @@ export default function Profile({ wide }: { wide: boolean }) {
     const need = shown.filter((id) => !details[id] && !requested.current.has(id));
     if (!need.length) return;
     need.forEach((id) => requested.current.add(id));
+    inflight.current += need.length;
     setLoading((n) => n + need.length);
+    const favSet = new Set(favs);
     need.forEach((id) => {
       api.video(id)
-        .then((d) => setDetails((m) => ({ ...m, [id]: d })))
+        .then((d) => {
+          setDetails((m) => ({ ...m, [id]: d }));
+          // 收藏的最新详情顺带比一下集数：有更新马上标「更新至 N 集」，不用等定时检查
+          if (favSet.has(id)) noteFavDetail(id, d?.episode_count || d?.episodes?.length || 0);
+        })
         .catch(() => { requested.current.delete(id); })
-        .finally(() => setLoading((n) => n - 1));
+        .finally(() => { inflight.current -= 1; setLoading((n) => n - 1); });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shown.join(",")]);
 
-  /* 滑到底、上一批加载完后再拉下一批 */
+  /* 滑到底、上一批加载完后再拉下一批。「加载中」看 inflight：上面的 effect 在同一次提交里先发出请求、
+     同步记下数量；loading 状态要下一次渲染才更新，只看它会在新一批还没发出时又多翻一页（一打开就连拉好几批）。
+     一批回来后按显示的条数重新挂上监听（请求很快时 loading 在同一次渲染里就回到 0，不会触发重跑） */
   useEffect(() => {
     const el = moreRef.current;
-    if (!el || loading > 0 || limit >= ids.length) return undefined;
+    if (!el || loading > 0 || inflight.current > 0 || limit >= ids.length) return undefined;
     const io = new IntersectionObserver((entries) => {
       if (entries.some((e) => e.isIntersecting)) setLimit((n) => n + PAGE);
     }, { root: scrollRef.current, rootMargin: "200px" });
     io.observe(el);
     return () => io.disconnect();
-  }, [limit, ids.length, loading]);
+  }, [limit, ids.length, loading, cards.length]);
 
   return (
     <div className="absolute inset-0 bg-bg flex flex-col">
@@ -140,12 +153,15 @@ export default function Profile({ wide }: { wide: boolean }) {
                       第 {p.ep} 集{p.t > 3 ? ` · ${fmtTime(p.t)}` : ""}
                     </div>
                   )}
-                  {tab === "fav" && c.id in updates && (
-                    <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-full bg-primary text-on-primary text-[9.5px] font-semibold leading-none">
-                      更新至 {updates[c.id]} 集
-                    </div>
-                  )}
-                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-1.5">
+                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-1.5 pt-4">
+                    {/* 收藏：标题上方写这部剧有几集；有更新时同一处换成高亮的「更新至 N 集」，不重复写两遍 */}
+                    {tab === "fav" && (c.id in updates ? (
+                      <span className="inline-block mb-1 px-1.5 py-0.5 rounded-full bg-primary text-on-primary text-[9.5px] font-semibold leading-none">
+                        更新至 {updates[c.id]} 集
+                      </span>
+                    ) : episodeCount(c) > 0 && (
+                      <div className="mb-0.5 text-[10px] font-semibold text-white/85 tsh">共 {episodeCount(c)} 集</div>
+                    ))}
                     <div className="text-[10.5px] text-white clamp-2 leading-tight">{c.title}</div>
                   </div>
                 </button>
@@ -197,6 +213,9 @@ function OfflineList() {
     else if (e.state === "error") {
       const detail = series[vid];
       if (detail) cacheEpisodes(detail, [e.ep]).then(() => toast("已重新加入缓存队列", "ok")).catch(() => toast("加入缓存失败", "info"));
+    } else if (interrupted(e)) {
+      resumeOffline();
+      toast(`第 ${e.ep} 集继续下载`, "ok");
     } else toast(`第 ${e.ep} 集${offlineLabel(e)}`, "info");
   };
   const remove = (vid: number) => {
@@ -211,6 +230,8 @@ function OfflineList() {
       {groups.map(({ vid, eps }) => {
         const done = eps.filter((e) => e.state === "done").length;
         const active = eps.find((e) => e.state === "downloading");
+        const stalled = eps.find(interrupted);
+        const failed = eps.filter((e) => e.state === "error");
         return (
           <div key={vid} className="rounded-(--r-md) bg-s1 p-2.5 flex gap-3 elev-1">
             <div className="relative w-[60px] shrink-0 rounded-(--r-sm) overflow-hidden bg-s3" style={{ aspectRatio: "3 / 4" }}>
@@ -228,11 +249,20 @@ function OfflineList() {
                 已缓存 {done}/{eps.length} 集 · {fmtBytes(eps.reduce((n, e) => n + e.bytes, 0))}
                 {active ? ` · 第 ${active.ep} 集${offlineLabel(active)}` : ""}
               </div>
+              {/* 说清楚为什么没下完：网络中断会在回到应用或网络恢复时自动继续；失败的集点一下重试 */}
+              {!active && stalled && (
+                <div className="text-[10.5px] text-mut mt-0.5">第 {stalled.ep} 集网络中断（{stalled.error}），回到应用后自动继续</div>
+              )}
+              {failed.length > 0 && (
+                <div className="text-[10.5px] text-red-400 mt-0.5">
+                  第 {failed.map((e) => e.ep).join("、")} 集失败{failed[0].error ? `（${failed[0].error}）` : ""}，点集数重试
+                </div>
+              )}
               <div className="flex flex-wrap gap-1.5 mt-2">
                 {eps.map((e) => (
                   <button key={e.ep} onClick={() => open(vid, e)} aria-label={`第 ${e.ep} 集 ${offlineLabel(e)}`}
                     className={`h-7 min-w-[30px] px-2 rounded-(--r-sm) text-[11px] font-semibold pressable ${e.state === "done" ? "bg-s3 text-on" : e.state === "error" ? "bg-s3 text-red-400" : "bg-s3 text-mut"}`}>
-                    {e.ep}{e.state === "done" ? "" : e.state === "error" ? " 失败" : e.state === "downloading" && e.total ? ` ${Math.floor((e.done / e.total) * 100)}%` : " 等待"}
+                    {e.ep}{e.state === "done" ? "" : e.state === "error" ? " 失败" : e.state === "downloading" ? (e.total ? ` ${Math.floor((e.done / e.total) * 100)}%` : " 准备") : interrupted(e) ? " 中断" : " 等待"}
                   </button>
                 ))}
               </div>

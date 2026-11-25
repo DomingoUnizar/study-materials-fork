@@ -16,11 +16,16 @@ const withEpisodes = params.get("detail") === "episodes";
 const hevcStreams = params.get("hevc") === "1";
 // Series detail with a real cover image (the test serves it), to check what each section shows while switching.
 const withCovers = params.get("covers") === "1";
-// Offline cache fixture: series 991, episode 1 cached, episode 2 still downloading.
+// Offline cache fixture: series 991, episode 1 cached, episode 2 still downloading. With interrupted=1, episode 2
+// instead waits in the queue after a network interruption, and episode 3 failed for good.
+const interruptedDownload = params.get("interrupted") === "1";
 const offlineList = params.get("offline") === "1" ? {
   episodes: [
     { vid: 991, ep: 1, title: "测试短剧", state: "done", done: 3, total: 3, bytes: 3 * 1024 * 1024, seq: 1 },
-    { vid: 991, ep: 2, title: "测试短剧", state: "downloading", done: 1, total: 2, bytes: 1024 * 1024, seq: 2 },
+    interruptedDownload
+      ? { vid: 991, ep: 2, title: "测试短剧", state: "queued", error: "网络超时", done: 1, total: 2, bytes: 1024 * 1024, seq: 2 }
+      : { vid: 991, ep: 2, title: "测试短剧", state: "downloading", done: 1, total: 2, bytes: 1024 * 1024, seq: 2 },
+    ...(interruptedDownload ? [{ vid: 991, ep: 3, title: "测试短剧", state: "error", error: "HTTP 404", done: 0, total: 0, bytes: 0, seq: 3 }] : []),
   ],
   series: { 991: { id: 991, title: "测试短剧", cover: "", description: "", tags: [], score: 0, episode_count: 4, total_episodes: 4,
     episodes: [1, 2, 3, 4].map(ep_num => ({ ep_num, title: `第${ep_num}集`, duration: 60, status: 1 })) } },
@@ -50,7 +55,8 @@ const fixture = {
       ? [card(991, `已加载${key || cmd}`, []), card(992, "男同题材", ["都市", "男同"]), card(993, "另一部", ["校园"]),
         card(994, "第三部", ["古风"]), card(995, "第四部", ["职场"])]
       : [card(991, `已加载${key || cmd}`, [])];
-    request.resolve({ items, pagination: { page: 1, pages: 1, size: 8, total: items.length } });
+    // "mixed" also reports the channel's full upstream size, far more than one loaded page
+    request.resolve({ items, pagination: { page: 1, pages: 1, size: 8, total: result === "mixed" ? 1764 : items.length } });
   },
 };
 

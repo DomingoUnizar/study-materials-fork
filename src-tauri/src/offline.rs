@@ -2,6 +2,9 @@
 //!
 //! - 队列一次只下载一个文件，按加入顺序逐集进行；前端在线播放时调用 [`set_paused`]，
 //!   下载在两个文件之间停下等待，不和播放抢带宽，也不对上游形成突发请求。
+//! - 网络中断（超时、连不上、5xx）不算失败：同一个文件隔几秒重试几次，仍不通就把这一集放回队列、
+//!   保留已下载的文件，队列停下来等唤醒（回到应用、网络恢复或新的缓存操作，见 [`resume`]），不定时重试。
+//! - 地址签名过期（401/403/404/410）就重新取地址接着下；只有连续几次刷新都没有新进度才算失败。
 //! - 文件永久保留，只在用户删除时清理（卸载应用时随应用数据一起删除）。
 //! - 目录：`<root>/<剧 id>/series.json`（剧集信息）、`cover`（封面）；
 //!   `<root>/<剧 id>/<集>/meta.json`、`index.m3u8`（写入即表示完成）、`s<n>.ts` / `k<n>.key` / `m<n>.mp4`。
@@ -44,10 +47,79 @@ pub struct Episode {
 struct Offline {
     root: PathBuf,
     paused: AtomicBool,
+    /// 上一集因网络中断停下：等下一次唤醒再继续，不立刻重试
+    stalled: AtomicBool,
     wake: Notify,
     seq: AtomicU64,
     cancelled: Mutex<HashSet<(i64, u32)>>,
     io: Mutex<()>,
+}
+
+/// 一集没下完的两种结局
+#[derive(Debug, PartialEq)]
+enum Failure {
+    /// 网络不通：回到队列、保留进度，等唤醒后接着下
+    Interrupted(String),
+    /// 不会自己恢复（地址拿不到、写入失败、播放列表变了……）：标记失败，等用户点重试
+    Fatal(String),
+}
+
+/// 同一个文件遇到网络错误时的重试间隔（之后仍不通就停下等唤醒）
+#[cfg(not(test))]
+const RETRY_DELAYS_MS: [u64; 3] = [3_000, 10_000, 30_000];
+#[cfg(test)]
+const RETRY_DELAYS_MS: [u64; 3] = [5, 5, 5];
+
+fn http_status(error: &str) -> Option<u16> {
+    error.strip_prefix("HTTP ")?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// 网络中断类错误：超时、连不上、连接被断开、上游 408/425/429/5xx。
+/// 上游明确拒绝（其余 4xx）、业务错误（如「暂无播放地址」）和本地写入失败都不算。
+fn is_interruption(error: &str) -> bool {
+    if let Some(status) = http_status(error) {
+        return matches!(status, 408 | 425 | 429 | 500..=599);
+    }
+    let lower = error.to_ascii_lowercase();
+    error.contains("超时")
+        || [
+            "timed out",
+            "timeout",
+            "error sending request",
+            "connect",
+            "connection",
+            "dns",
+            "tunnel",
+            "reset",
+            "broken pipe",
+            "unexpected eof",
+            "decoding response body",
+            "network",
+        ]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+/// 记进 meta.json、显示给用户的原因：只留简短说明，不带地址（地址里有签名）。
+fn reason(error: &str) -> String {
+    if let Some(status) = http_status(error) {
+        return format!("HTTP {status}");
+    }
+    let lower = error.to_ascii_lowercase();
+    if error.contains("超时") || lower.contains("timed out") || lower.contains("timeout") {
+        return "网络超时".into();
+    }
+    if lower.contains("dns") {
+        return "域名解析失败".into();
+    }
+    if lower.contains("error sending request") || lower.contains("connect") || lower.contains("tunnel") {
+        return "网络连接失败".into();
+    }
+    if is_interruption(error) {
+        return "下载中断".into();
+    }
+    let text: String = error.split("http").next().unwrap_or("").trim().chars().take(40).collect();
+    if text.is_empty() { "下载失败".into() } else { text }
 }
 
 static OFFLINE: OnceCell<Arc<Offline>> = OnceCell::new();
@@ -76,6 +148,13 @@ pub fn delete(vid: i64, ep: Option<u32>) -> Result<(), String> {
 pub fn set_paused(paused: bool) {
     if let Some(offline) = OFFLINE.get() {
         offline.set_paused(paused);
+    }
+}
+
+/// 网络中断后停下的队列接着下（前端在回到应用、网络恢复或用户点了中断的集时调用）。
+pub fn resume() {
+    if let Some(offline) = OFFLINE.get() {
+        offline.kick();
     }
 }
 
@@ -120,6 +199,7 @@ impl Offline {
         Arc::new(Self {
             root,
             paused: AtomicBool::new(false),
+            stalled: AtomicBool::new(false),
             wake: Notify::new(),
             seq: AtomicU64::new(max_seq + 1),
             cancelled: Mutex::new(HashSet::new()),
@@ -139,6 +219,10 @@ impl Offline {
         let _io = self.io.lock().unwrap();
         let mut episodes = scan(&self.root);
         episodes.sort_by_key(|e| e.seq);
+        // 旧版本记下的是原始错误（可能带签名地址），列出来时统一换成简短原因
+        for ep in &mut episodes {
+            ep.error = ep.error.as_deref().map(reason);
+        }
         let mut series = serde_json::Map::new();
         for vid in episodes.iter().map(|e| e.vid).collect::<HashSet<_>>() {
             if let Ok(text) = fs::read_to_string(self.series_dir(vid).join("series.json")) {
@@ -193,9 +277,15 @@ impl Offline {
             changed.push(meta);
         }
         if !changed.is_empty() {
-            self.wake.notify_one();
+            self.kick();
         }
         Ok(changed)
+    }
+
+    /// 唤醒下载循环；网络中断后停着的队列也一起恢复
+    fn kick(&self) {
+        self.stalled.store(false, Ordering::SeqCst);
+        self.wake.notify_one();
     }
 
     fn delete(&self, vid: i64, ep: Option<u32>) -> Result<(), String> {
@@ -222,7 +312,7 @@ impl Offline {
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
         if !paused {
-            self.wake.notify_one();
+            self.kick();
         }
     }
 
@@ -260,6 +350,11 @@ impl Offline {
     {
         loop {
             self.wait_resume().await;
+            // 上一集网络中断：等唤醒（回到应用、网络恢复、离开播放页、新的缓存操作）再试，不自己定时重试
+            if self.stalled.load(Ordering::SeqCst) {
+                self.wake.notified().await;
+                continue;
+            }
             let job = {
                 let _io = self.io.lock().unwrap();
                 scan(&self.root)
@@ -299,16 +394,44 @@ impl Offline {
         }
         match result {
             Ok(()) => ep.state = "done".into(),
-            Err(e) => {
+            // 回到队列，已下载的文件留着；error 只是给界面看的中断原因，下次开始下载时清掉
+            Err(Failure::Interrupted(e)) => {
+                ep.state = "queued".into();
+                ep.error = Some(reason(&e));
+                self.stalled.store(true, Ordering::SeqCst);
+            }
+            Err(Failure::Fatal(e)) => {
                 ep.state = "error".into();
-                ep.error = Some(e);
+                ep.error = Some(reason(&e));
             }
         }
         let _ = save_meta(&self.root, &ep);
         emit(&ep);
     }
 
-    async fn fetch_episode<P, PF, F, FF, E>(&self, ep: &mut Episode, play_url: &P, fetch: &F, emit: &E) -> Result<(), String>
+    /// 取地址和清单；网络不通时隔几秒重试几次，仍不通就算中断
+    async fn plan_for<P, PF, F, FF>(&self, ep: &Episode, play_url: &P, fetch: &F) -> Result<Plan, Failure>
+    where
+        P: Fn(i64, u32, bool) -> PF,
+        PF: Future<Output = Result<String, String>>,
+        F: Fn(String) -> FF,
+        FF: Future<Output = Result<Arc<Vec<u8>>, String>>,
+    {
+        let mut failures = 0;
+        loop {
+            match load_plan(ep, play_url, fetch).await {
+                Ok(plan) => return Ok(plan),
+                Err(e) if !is_interruption(&e) => return Err(Failure::Fatal(e)),
+                Err(e) if failures >= RETRY_DELAYS_MS.len() => return Err(Failure::Interrupted(e)),
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[failures])).await;
+                    failures += 1;
+                }
+            }
+        }
+    }
+
+    async fn fetch_episode<P, PF, F, FF, E>(&self, ep: &mut Episode, play_url: &P, fetch: &F, emit: &E) -> Result<(), Failure>
     where
         P: Fn(i64, u32, bool) -> PF,
         PF: Future<Output = Result<String, String>>,
@@ -317,7 +440,7 @@ impl Offline {
         E: Fn(&Episode),
     {
         let dir = self.episode_dir(ep.vid, ep.ep);
-        let mut plan = load_plan(ep, play_url, fetch).await?;
+        let mut plan = self.plan_for(ep, play_url, fetch).await?;
         ep.total = plan.files.len();
         ep.done = plan.files.iter().filter(|r| dir.join(&r.file).exists()).count();
         ep.bytes = plan
@@ -328,12 +451,16 @@ impl Offline {
             .sum();
         let _ = save_meta(&self.root, ep);
         emit(ep);
+        let write_failed = || Failure::Fatal("写入缓存失败，请检查存储空间".into());
+        // 连续刷新地址而没有新进度的次数；下到一个文件就清零，所以暂停很久或一集下很久都不会耗尽
         let mut refreshes = 0;
+        // 当前文件连续遇到网络错误的次数
+        let mut failures = 0;
         let mut i = 0;
         while i < plan.files.len() {
             self.wait_resume().await;
             if self.is_cancelled(ep) {
-                return Err("已取消".into());
+                return Err(Failure::Fatal("已取消".into()));
             }
             let path = dir.join(&plan.files[i].file);
             if path.exists() {
@@ -343,27 +470,39 @@ impl Offline {
             match fetch(plan.files[i].url.clone()).await {
                 Ok(bytes) => {
                     if self.is_cancelled(ep) {
-                        return Err("已取消".into());
+                        return Err(Failure::Fatal("已取消".into()));
                     }
-                    write_atomic(&path, &bytes).map_err(|_| "写入缓存失败，请检查存储空间")?;
+                    write_atomic(&path, &bytes).map_err(|_| write_failed())?;
                     ep.done += 1;
                     ep.bytes += bytes.len() as u64;
                     let _ = save_meta(&self.root, ep);
                     emit(ep);
+                    refreshes = 0;
+                    failures = 0;
                     i += 1;
                 }
-                // 播放地址带时效签名：中途过期就重新取一次地址，按同样的序号接着下载
-                Err(e) if upstream_status(&e) != 502 && refreshes < 3 => {
+                // 播放地址带时效签名：过期（比如在线播放时暂停了很久）就重新取地址，按同样的序号接着下载
+                Err(e) if upstream_status(&e) != 502 => {
+                    if refreshes >= 3 {
+                        return Err(Failure::Fatal(e));
+                    }
                     refreshes += 1;
-                    plan = load_plan(ep, play_url, fetch).await?;
+                    plan = self.plan_for(ep, play_url, fetch).await?;
                     if plan.files.len() != ep.total {
-                        return Err("播放列表已变化，请删除后重新缓存".into());
+                        return Err(Failure::Fatal("播放列表已变化，请删除后重新缓存".into()));
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) if is_interruption(&e) => {
+                    if failures >= RETRY_DELAYS_MS.len() {
+                        return Err(Failure::Interrupted(e));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[failures])).await;
+                    failures += 1;
+                }
+                Err(e) => return Err(Failure::Fatal(e)),
             }
         }
-        write_atomic(&dir.join("index.m3u8"), plan.text.as_bytes()).map_err(|_| "写入缓存失败，请检查存储空间")?;
+        write_atomic(&dir.join("index.m3u8"), plan.text.as_bytes()).map_err(|_| write_failed())?;
         Ok(())
     }
 }
@@ -725,5 +864,117 @@ mod tests {
         assert_eq!(reopened.seq.load(Ordering::SeqCst), 8);
         worker.abort();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn network_interruptions_keep_progress_and_wait_for_a_wake() {
+        let root = temp_root("interrupt");
+        let offline = Offline::new(root.clone());
+        let online = Arc::new(AtomicBool::new(false));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let (online, fetches) = (online.clone(), fetches.clone());
+            move |url: String| {
+                let (online, fetches) = (online.clone(), fetches.clone());
+                async move {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    if url.contains("index.m3u8") {
+                        return Ok(Arc::new(MEDIA.as_bytes().to_vec()));
+                    }
+                    // 下到第二个分片时「断网」（比如切到后台被系统断了网）
+                    if url.contains("seg1") && !online.load(Ordering::SeqCst) {
+                        return Err(format!("error sending request for url ({url}) ← operation timed out"));
+                    }
+                    Ok(Arc::new(b"data".to_vec()))
+                }
+            }
+        };
+        let worker = tokio::spawn(offline.clone().run(
+            |vid: i64, ep: u32, _hevc: bool| async move { Ok(format!("https://cdn.example/{vid}/{ep}/index.m3u8")) },
+            fetch,
+            |_: &Episode| {},
+        ));
+        offline.enqueue(6, &[1], "剧", &json!({}), false).unwrap();
+        // 重试几次仍不通：回到队列，已下的文件留着，记下简短原因（不带地址）
+        let eps = wait_until(&root, |eps| eps.iter().any(|e| e.state == "queued" && e.error.is_some())).await;
+        assert_eq!(eps[0].error.as_deref(), Some("网络超时"));
+        assert_eq!(eps[0].done, 2, "the key and the first segment are kept");
+        assert!(root.join("6").join("1").join("s1.ts").exists());
+        let idle = fetches.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), idle, "an interrupted queue waits for a wake, no timed retries");
+        // 回到应用 / 网络恢复：接着下剩下的分片
+        online.store(true, Ordering::SeqCst);
+        offline.kick();
+        let eps = wait_until(&root, |eps| eps.iter().all(|e| e.state == "done")).await;
+        assert!(eps[0].error.is_none() && eps[0].done == 3);
+        worker.abort();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_signatures_refresh_as_long_as_the_download_progresses() {
+        let root = temp_root("refresh");
+        let offline = Offline::new(root.clone());
+        let plays = Arc::new(AtomicUsize::new(0));
+        let play_url = {
+            let plays = plays.clone();
+            move |vid: i64, ep: u32, _hevc: bool| {
+                let n = plays.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if vid == 8 {
+                        return Err("暂无播放地址".to_string());
+                    }
+                    Ok(format!("https://cdn.example/{vid}/{ep}/index.m3u8?auth={n}"))
+                }
+            }
+        };
+        // 每个签名只够下一个文件（比如在线播放时下载暂停了很久）：要刷新的次数比 3 次多，但每次刷新后都有进度
+        let used = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let fetch = {
+            let used = used.clone();
+            move |url: String| {
+                let used = used.clone();
+                async move {
+                    let auth = url.split("auth=").nth(1).unwrap_or("").to_string();
+                    if url.contains("index.m3u8") {
+                        let segs: String = (0..5).map(|i| format!("#EXTINF:6,\nseg{i}.ts?auth={auth}\n")).collect();
+                        return Ok(Arc::new(format!("#EXTM3U\n#EXT-X-TARGETDURATION:6\n{segs}#EXT-X-ENDLIST\n").into_bytes()));
+                    }
+                    if !used.lock().unwrap().insert(auth) {
+                        return Err("HTTP 403 Forbidden".to_string());
+                    }
+                    Ok(Arc::new(b"data".to_vec()))
+                }
+            }
+        };
+        let worker = tokio::spawn(offline.clone().run(play_url, fetch, |_: &Episode| {}));
+        offline.enqueue(8, &[1], "拿不到地址的剧", &json!({}), false).unwrap();
+        offline.enqueue(7, &[1], "剧", &json!({}), false).unwrap();
+        let eps = wait_until(&root, |eps| eps.len() == 2 && eps.iter().all(|e| e.state == "done" || e.state == "error")).await;
+        let ok = eps.iter().find(|e| e.vid == 7).unwrap();
+        assert_eq!((ok.state.as_str(), ok.done, ok.total), ("done", 5, 5));
+        // 不会自己恢复的错误：标记失败，不卡住后面的集
+        let failed = eps.iter().find(|e| e.vid == 8).unwrap();
+        assert_eq!((failed.state.as_str(), failed.error.as_deref()), ("error", Some("暂无播放地址")));
+        assert_eq!(plays.load(Ordering::SeqCst), 6, "one failed lookup, then one address per segment");
+        worker.abort();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failure_reasons_are_short_and_never_carry_signed_addresses() {
+        assert_eq!(reason("HTTP 403 Forbidden"), "HTTP 403");
+        assert_eq!(reason("请求超时"), "网络超时");
+        assert_eq!(reason("error sending request for url (https://cdn.example/a.ts?auth_key=1-2-3) ← tcp connect error"), "网络连接失败");
+        assert_eq!(reason("error decoding response body ← operation timed out"), "网络超时");
+        assert_eq!(reason("暂无播放地址"), "暂无播放地址");
+        assert_eq!(reason("播放列表格式不对 https://cdn.example/a.m3u8?auth_key=9"), "播放列表格式不对");
+        // 已经是简短原因的再过一遍不变（列表会对旧版本记下的原始错误再整理一次）
+        for short in ["HTTP 403", "网络超时", "网络连接失败", "域名解析失败", "下载中断", "暂无播放地址", "播放列表已变化，请删除后重新缓存"] {
+            assert_eq!(reason(short), short);
+        }
+        assert!(is_interruption("HTTP 503 Service Unavailable") && is_interruption("请求超时"));
+        assert!(!is_interruption("HTTP 404 Not Found") && !is_interruption("暂无播放地址") && !is_interruption("写入缓存失败，请检查存储空间"));
     }
 }

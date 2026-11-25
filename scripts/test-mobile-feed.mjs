@@ -246,21 +246,91 @@ try {
   assert.deepEqual(await plays(), [], "Cached episode must not request a play address");
   assert(!(await offlineCalls()).some(c => c.cmd === "offline_set_paused" && c.args.paused), "Local playback keeps downloads running");
   await page.getByRole("button", { name: "缓存", exact: true }).click();
-  const cacheRest = page.getByRole("button", { name: /缓存本剧剩余 2 集/ });
-  await cacheRest.waitFor({ state: "visible" });
-  assert(await page.getByRole("button", { name: /缓存本集（第 1 集）/ }).isDisabled(), "A cached episode cannot be queued again");
-  await cacheRest.click();
+  // The sheet lists every episode to pick from. Cached and downloading ones cannot be picked again; the episode
+  // on screen (1) is already cached, so nothing starts out picked.
+  const cell = n => page.getByRole("button", { name: new RegExp(`^第 ${n} 集`) });
+  const queueButton = page.getByRole("button", { name: /缓存所选|先点选/ });
+  await cell(4).waitFor({ state: "visible" });
+  assert(await cell(1).isDisabled(), "A cached episode cannot be queued again");
+  assert(await cell(2).isDisabled(), "A downloading episode cannot be queued again");
+  assert(await queueButton.isDisabled(), "Nothing is picked while the episode on screen is cached");
+  await cell(4).click();
+  await page.getByRole("button", { name: "缓存所选 1 集", exact: true }).waitFor({ state: "visible" });
+  await cell(4).click(); // picking again un-picks
+  assert(await queueButton.isDisabled(), "Un-picking leaves nothing to queue");
+  await page.getByRole("button", { name: "全选", exact: true }).click();
+  assert.equal(await cell(3).getAttribute("aria-pressed"), "true");
+  await page.getByRole("button", { name: "缓存所选 2 集", exact: true }).click();
   await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_enqueue"), "Cache sheet queues episodes");
   const enqueued = (await offlineCalls()).find(c => c.cmd === "offline_enqueue").args;
-  assert.deepEqual([enqueued.vid, enqueued.eps], [991, [3, 4]], "Only episodes neither cached nor downloading are queued");
-  await cacheRest.waitFor({ state: "detached" }); // the closing sheet's backdrop would swallow the swipe
+  assert.deepEqual([enqueued.vid, enqueued.eps], [991, [3, 4]], "Only the picked episodes are queued");
+  await queueButton.waitFor({ state: "detached" }); // the closing sheet's backdrop would swallow the swipe
   await swipe(300, 100);
   await page.waitForFunction(() => document.querySelectorAll("section").length === 4);
   await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
   await until(async () => (await plays()).includes(2), "Uncached episode 2 requests a play address");
   await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_set_paused" && c.args.paused === true), "Online playback pauses downloads");
   report.metrics.offline = { local_playlists: mediaRequests.filter(u => u.startsWith("/offline/")), queued: enqueued.eps };
-  report.passed.push("Offline: cached episode plays locally without a play request; cache sheet queues episodes 3-4; online playback pauses downloads");
+  report.passed.push("Offline: cached episode plays locally without a play request; the cache sheet picks episodes one by one (cached/downloading ones locked, select all) and queues 3-4; online playback pauses downloads");
+
+  // A download stopped by a network interruption waits in the queue; it goes on when the app comes back to the
+  // foreground (or the network returns), and the cache list says why it stopped.
+  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&offline=1&interrupted=1`);
+  await page.getByRole("button", { name: "离线缓存", exact: true }).click();
+  await page.getByText(/第 2 集网络中断（网络超时），回到应用后自动继续/).waitFor({ state: "visible" });
+  await page.getByText(/第 3 集失败（HTTP 404），点集数重试/).waitFor({ state: "visible" });
+  const resumes = async () => (await offlineCalls()).filter(c => c.cmd === "offline_resume").length;
+  assert.equal(await resumes(), 0, "Nothing resumes on its own");
+  await background(50);
+  await until(async () => (await resumes()) === 1, "Coming back to the app resumes the interrupted download");
+  await page.getByRole("button", { name: /^第 2 集/ }).click();
+  await until(async () => (await resumes()) === 2, "Tapping the interrupted episode resumes it");
+  report.passed.push("Offline: an interrupted download shows why and resumes when the app returns to the foreground or the episode is tapped; failures show their reason");
+
+  // Sleep timer (clock button, top right): 「播完本集」stops at the end of the episode instead of playing the next
+  // one; a timed choice pauses the video when the time is up. Either way the timer is off afterwards.
+  playlists.length = 0;
+  await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile&toasts=1`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await page.evaluate(() => window.apiLoadingFixture.complete("api_feed", "", "item"));
+  await page.locator("section video").waitFor({ state: "attached" });
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_video"));
+  await until(() => playlists.length > 0, "Episode 1 loads");
+  const endEpisode = () => page.evaluate(() => document.querySelector("section video").dispatchEvent(new Event("ended")));
+  const loadedBeforeEnd = playlists.length;
+  await endEpisode();
+  await until(async () => (await plays()).includes(2), "Without a timer the next episode follows");
+  await until(() => playlists.length > loadedBeforeEnd, "Episode 2 loads");
+  const clock = page.getByRole("button", { name: "定时关闭", exact: true });
+  assert.equal(await clock.getAttribute("aria-pressed"), "false");
+  await clock.click();
+  const afterEpisode = page.getByRole("button", { name: "播完本集", exact: true });
+  await afterEpisode.click();
+  await page.getByText("本集播完后暂停播放", { exact: true }).waitFor({ state: "visible" });
+  await afterEpisode.waitFor({ state: "detached" });
+  assert.equal(await clock.getAttribute("aria-pressed"), "true", "The clock shows the timer is on");
+  const playsAtEnd = (await plays()).length;
+  await endEpisode();
+  await page.getByText("定时关闭：本集已播完", { exact: true }).waitFor({ state: "visible" });
+  await page.waitForTimeout(300);
+  assert.equal((await plays()).length, playsAtEnd, "「播完本集」stops instead of playing episode 3");
+  assert.equal(await clock.getAttribute("aria-pressed"), "false", "The timer is off once it has stopped playback");
+  await clock.click();
+  await page.getByRole("button", { name: "30 分钟", exact: true }).click();
+  await page.getByRole("button", { name: "30 分钟", exact: true }).waitFor({ state: "detached" });
+  await clock.click();
+  await page.getByText(/^将在 \d\d:\d\d 暂停播放$/).waitFor({ state: "visible" });
+  assert.equal(await page.getByRole("button", { name: "30 分钟", exact: true }).getAttribute("aria-pressed"), "true", "The sheet marks the running choice");
+  await page.getByRole("button", { name: "取消定时", exact: true }).click();
+  await page.getByRole("button", { name: "30 分钟", exact: true }).waitFor({ state: "detached" });
+  assert.equal(await clock.getAttribute("aria-pressed"), "false", "取消定时 switches it off");
+  // Time up: the same module call the sheet makes, with a 60 ms timer.
+  await page.evaluate(() => { const v = document.querySelector("section video"); v.__pauses = 0; const pause = v.pause.bind(v); v.pause = () => { v.__pauses++; pause(); }; });
+  await page.evaluate(async () => (await import("/src/sleepTimer.ts")).setSleepTimer(0.001));
+  await page.getByText("定时关闭：已暂停播放", { exact: true }).waitFor({ state: "visible" });
+  assert(await page.evaluate(() => document.querySelector("section video").__pauses > 0), "Time up pauses the video");
+  assert.equal(await clock.getAttribute("aria-pressed"), "false");
+  report.passed.push("Sleep timer: the clock button opens it; 「播完本集」stops at the end instead of playing the next episode; a timed choice pauses the video when time is up; 取消定时 switches it off");
 
   // Favourites load in batches of 12 as the list scrolls; every detail is requested once.
   await page.evaluate(() => localStorage.setItem("hghub_app_v1", JSON.stringify({ favs: Array.from({ length: 30 }, (_, i) => 5000 + i) })));
@@ -294,21 +364,51 @@ try {
   // Favourite updates: a check compares every favourite's episode count with the last one seen (the fixture
   // detail has 4 episodes). Updated favourites move to the front with a badge and a count on the tab; checks are
   // at least 6 hours apart; seeing the series clears its badge.
-  await page.evaluate(() => {
+  const favUpdates = (fn, ...args) => page.evaluate(async ([name, rest]) => (await import("/src/favUpdates.ts"))[name](...rest), [fn, args]);
+  const seenTwoOfFour = () => page.evaluate(() => {
     localStorage.setItem("hghub_app_v1", JSON.stringify({ favs: [5001, 991] }));
     localStorage.setItem("hghub_fav_seen", JSON.stringify({ 991: 2, 5001: 4 }));
   });
-  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&detail=episodes`);
-  const favUpdates = (fn, ...args) => page.evaluate(async ([name, rest]) => (await import("/src/favUpdates.ts"))[name](...rest), [fn, args]);
+  // The timed check (start-up / back in the foreground) runs on a page that does not load the favourites itself.
+  await seenTwoOfFour();
+  await page.goto(`${origin}tests/api-loading.html?page=home&detail=episodes`);
+  await page.waitForFunction(() => window.apiLoadingFixture?.ready);
   assert.deepEqual(await favUpdates("checkFavUpdates", [5001, 991]), [991], "Only the favourite with new episodes is reported");
+  assert.deepEqual(await favUpdates("checkFavUpdates", [5001, 991]), [], "A second check within 6 hours is skipped");
+  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&detail=episodes`);
   await page.getByText("更新至 4 集", { exact: true }).waitFor({ state: "visible" });
   assert.match(await page.getByRole("button", { name: /我的收藏/ }).innerText(), /我的收藏\s*·\s*1/, "The favourites tab shows the update count");
   const firstCard = await page.locator(".grid button").first().innerText();
   assert(firstCard.includes("更新至 4 集"), "The updated favourite comes first");
-  assert.deepEqual(await favUpdates("checkFavUpdates", [5001, 991]), [], "A second check within 6 hours is skipped");
+  // Every favourite's cover says how many episodes it has, above the title; an updated one says 更新至 there instead.
+  assert(!firstCard.includes("共 4 集"), "The updated favourite does not repeat its episode count");
+  assert.equal(await page.getByText("共 4 集", { exact: true }).count(), 1, "The other favourite shows its episode count");
   await favUpdates("markSeen", 991, 4);
   await page.getByText("更新至 4 集", { exact: true }).waitFor({ state: "detached" });
-  report.passed.push("Favourite updates: new episodes are found per favourite, shown first with a badge and a tab count; checks are 6 hours apart; seeing the series clears it");
+  assert.equal(await page.getByText("共 4 集", { exact: true }).count(), 2, "Once seen, it shows its episode count again");
+  await page.evaluate(() => localStorage.clear());
+
+  // Opening the favourites compares the details the page loads anyway: the update shows at once, before the timed
+  // check is due again, and without any extra request.
+  await seenTwoOfFour();
+  await page.evaluate(() => localStorage.setItem("hghub_fav_checked_at", String(Date.now())));
+  await page.goto(`${origin}tests/api-loading.html?page=profile&layout=mobile&detail=episodes`);
+  await page.getByText("更新至 4 集", { exact: true }).waitFor({ state: "visible" });
+  assert((await page.locator(".grid button").first().innerText()).includes("更新至 4 集"), "The update found on opening comes first");
+  assert.deepEqual((await videoCalls()).sort((a, b) => a - b), [991, 5001], "Only the details the page shows are requested");
+  await page.evaluate(() => localStorage.clear());
+
+  // A check that gets nothing (offline, upstream down) gives up after a few failures and does not count: the next
+  // return to the app checks again instead of waiting 6 hours.
+  const tenFavs = Array.from({ length: 10 }, (_, i) => 6000 + i);
+  await page.evaluate(favs => localStorage.setItem("hghub_app_v1", JSON.stringify({ favs })), tenFavs);
+  await page.goto(`${origin}tests/api-loading.html?page=home`); // every detail request fails here
+  await page.waitForFunction(() => window.apiLoadingFixture?.ready);
+  assert.deepEqual(await favUpdates("checkFavUpdates", tenFavs), []);
+  const failedCalls = (await videoCalls()).length;
+  assert(failedCalls > 0 && failedCalls <= 4, `A failing check stops after a few requests (${failedCalls})`);
+  assert.equal(await page.evaluate(() => localStorage.getItem("hghub_fav_checked_at")), null, "A check that got nothing does not count");
+  report.passed.push("Favourite updates: new episodes are found per favourite, shown first with a badge and a tab count; timed checks are 6 hours apart, a check that got nothing does not count; opening the favourites shows updates at once with no extra requests; seeing the series clears it; every favourite's cover shows its episode count above the title");
   await page.evaluate(() => localStorage.clear());
 
   // HEVC: an Android device that reports HEVC support tries the hevc stream first (same resolution, about
@@ -334,7 +434,8 @@ try {
     const queued = async () => (await offlineCalls()).filter(c => c.cmd === "offline_enqueue");
     const before = (await queued()).length;
     await page.getByRole("button", { name: "缓存", exact: true }).click();
-    const button = page.getByRole("button", { name: /缓存本集（第 1 集）/ });
+    // The episode on screen starts out picked
+    const button = page.getByRole("button", { name: "缓存所选 1 集", exact: true });
     await button.click();
     await until(async () => (await queued()).length > before, "Cache sheet queues the episode");
     await button.waitFor({ state: "detached" });

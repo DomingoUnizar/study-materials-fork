@@ -51,6 +51,19 @@ export function initOffline() {
   listen<OfflineEpisode>("offline-progress", (e) => {
     publish({ ...snapshot, episodes: { ...snapshot.episodes, [key(e.payload.vid, e.payload.ep)]: e.payload } });
   }).catch(() => {});
+  /* 下载因网络中断停下后，回到应用或网络恢复时接着下（只响应这两个事件，不定时重试） */
+  const nudge = () => { if (document.visibilityState === "visible" && isInterrupted()) resumeOffline(); };
+  document.addEventListener("visibilitychange", nudge);
+  window.addEventListener("online", nudge);
+}
+
+/** 这一集因网络中断停在队列里（后端会把中断原因写在 error 里） */
+export const interrupted = (e?: OfflineEpisode) => e?.state === "queued" && !!e.error;
+const isInterrupted = () => Object.values(snapshot.episodes).some(interrupted);
+
+/** 让网络中断后停着的下载接着下 */
+export function resumeOffline() {
+  invoke("offline_resume").catch(() => {});
 }
 
 /** 把若干集加入离线下载队列 */

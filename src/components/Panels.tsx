@@ -3,7 +3,8 @@ import { api, fmt, cover as imageCover } from "../api";
 import { handleArticleClick, sanitizeHtml } from "../html";
 import type { Comment, CommentPage, Detail, Episode } from "../types";
 import { useStore } from "../store";
-import { cacheEpisodes, useOffline, type OfflineEpisode } from "../offline";
+import { cacheEpisodes, interrupted, useOffline, type OfflineEpisode } from "../offline";
+import { setSleepTimer, useSleepTimer } from "../sleepTimer";
 import { Avatar, Empty } from "./ui";
 import { IClose, IHeart, ISendF } from "../icons";
 
@@ -13,40 +14,115 @@ export function offlineLabel(e?: OfflineEpisode) {
   if (e.state === "done") return "已缓存";
   if (e.state === "error") return "失败，点此重试";
   if (e.state === "downloading") return e.total ? `下载中 ${Math.floor((e.done / e.total) * 100)}%` : "下载中";
+  if (interrupted(e)) return "网络中断，等待继续";
   return "排队中";
 }
 
-/* ================= 离线缓存（播放页） ================= */
+/** 集数格子里的一两个字 */
+function cellLabel(e: OfflineEpisode) {
+  if (e.state === "done") return "已缓存";
+  if (e.state === "error") return "失败";
+  if (e.state === "downloading") return e.total ? `${Math.floor((e.done / e.total) * 100)}%` : "下载中";
+  return interrupted(e) ? "中断" : "排队";
+}
+
+/* ================= 离线缓存（播放页）：按集勾选 ================= */
 export function CachePanel({ detail, curEp, onClose }: { detail?: Detail; curEp: number; onClose: () => void }) {
   const { toast } = useStore();
   const { episodes: cached } = useOffline();
+  const stateOf = (ep: number): OfflineEpisode | undefined => (detail ? cached[`${detail.id}:${ep}`] : undefined);
+  /* 已缓存、排队、下载中的集不能再选；失败的集可以重新选 */
+  const selectable = (ep: number) => { const s = stateOf(ep); return !s || s.state === "error"; };
+  /* 打开时默认勾上正在看的这一集（还没缓存的话） */
+  const [picked, setPicked] = useState<number[]>(() => (selectable(curEp) ? [curEp] : []));
   if (!detail?.episodes?.length) {
     return <div className="px-4 pb-6 pt-2 text-[12px] text-mut">选集还没加载好，稍后再试</div>;
   }
-  const stateOf = (ep: number) => cached[`${detail.id}:${ep}`];
-  const current = stateOf(curEp);
-  const rest = detail.episodes.map((e) => e.ep_num).filter((n) => n > curEp && (!stateOf(n) || stateOf(n)?.state === "error"));
-  const add = async (eps: number[]) => {
+  const all = detail.episodes.map((e) => e.ep_num);
+  const open = all.filter(selectable);
+  const chosen = picked.filter(selectable).sort((a, b) => a - b);
+  const allChosen = open.length > 0 && chosen.length === open.length;
+  const toggle = (ep: number) => setPicked((p) => (p.includes(ep) ? p.filter((x) => x !== ep) : [...p, ep]));
+  const add = async () => {
     try {
-      await cacheEpisodes(detail, eps);
-      toast(eps.length > 1 ? `已加入 ${eps.length} 集` : "已加入缓存队列", "ok");
+      await cacheEpisodes(detail, chosen);
+      toast(chosen.length > 1 ? `已加入 ${chosen.length} 集` : "已加入缓存队列", "ok");
       onClose();
     } catch (e) {
       toast(typeof e === "string" ? e : (e as Error).message || "加入缓存失败", "info");
     }
   };
-  const row = "w-full h-12 mt-2 px-4 rounded-(--r-ctl) bg-s3 flex items-center justify-between text-[13px] font-semibold text-on pressable disabled:opacity-50";
   return (
     <div className="px-4 pb-5">
-      <div className="text-[14px] font-bold text-on">离线缓存</div>
-      <div className="text-[11px] text-mut mt-1 leading-relaxed">缓存后可离线观看。一次只下载一个文件，在线播放时自动暂停；在「我的 → 离线缓存」查看和删除。</div>
-      <button onClick={() => void add([curEp])} disabled={!!current && current.state !== "error"} className={row}>
-        <span>缓存本集（第 {curEp} 集）</span>
-        <span className="text-[11.5px] font-normal text-mut">{offlineLabel(current)}</span>
+      <div className="flex items-center gap-2">
+        <div className="text-[14px] font-bold text-on">离线缓存</div>
+        <span className="text-[10.5px] text-mut">共 {all.length} 集</span>
+        {open.length > 0 && (
+          <button onClick={() => setPicked(allChosen ? [] : open)} className="ml-auto text-[11.5px] text-primary pressable">
+            {allChosen ? "取消全选" : "全选"}
+          </button>
+        )}
+      </div>
+      <div className="text-[11px] text-mut mt-1 leading-relaxed">点选要缓存的集。一次只下载一个文件，在线播放时自动暂停；在「我的 → 离线缓存」查看和删除。</div>
+      <div className="grid grid-cols-5 gap-2 mt-3 overflow-y-auto" style={{ maxHeight: "40vh" }}>
+        {all.map((ep) => {
+          const s = stateOf(ep);
+          const on = chosen.includes(ep);
+          return (
+            <button key={ep} onClick={() => toggle(ep)} disabled={!selectable(ep)} aria-pressed={on}
+              aria-label={`第 ${ep} 集${s ? `，${offlineLabel(s)}` : ""}`}
+              className={`h-11 rounded-(--r-sm) flex flex-col items-center justify-center leading-none pressable disabled:opacity-55 ${on ? "bg-primary text-on-primary" : "bg-s3 text-on/80"}`}>
+              <span className="text-[12.5px] font-semibold">{ep}</span>
+              {s && <span className={`mt-1 text-[9px] ${s.state === "error" && !on ? "text-red-400" : on ? "" : "text-mut"}`}>{cellLabel(s)}</span>}
+            </button>
+          );
+        })}
+      </div>
+      <button onClick={() => void add()} disabled={!chosen.length}
+        className="w-full h-11 mt-4 rounded-(--r-ctl) bg-primary text-on-primary text-[13px] font-semibold pressable disabled:opacity-45">
+        {chosen.length ? `缓存所选 ${chosen.length} 集` : open.length ? "先点选要缓存的集" : "全部集数都已在缓存中"}
       </button>
-      <button onClick={() => void add(rest)} disabled={!rest.length} className={row}>
-        <span>{rest.length ? `缓存本剧剩余 ${rest.length} 集` : "后面的集都已在缓存中"}</span>
-      </button>
+    </div>
+  );
+}
+
+/* ================= 定时关闭（播放页） ================= */
+const SLEEP_CHOICES: [string, number | "episode"][] = [
+  ["播完本集", "episode"], ["15 分钟", 15], ["30 分钟", 30], ["45 分钟", 45], ["60 分钟", 60], ["90 分钟", 90],
+];
+const clockOf = (t: number) => {
+  const d = new Date(t);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
+export function SleepPanel({ onClose }: { onClose: () => void }) {
+  const { toast } = useStore();
+  const sleep = useSleepTimer();
+  const pick = (choice: number | "episode" | "off") => {
+    setSleepTimer(choice);
+    toast(choice === "off" ? "已取消定时关闭" : choice === "episode" ? "本集播完后暂停播放" : `${choice} 分钟后暂停播放`, "ok");
+    onClose();
+  };
+  return (
+    <div className="px-4 pb-5">
+      <div className="text-[14px] font-bold text-on">定时关闭</div>
+      <div className="text-[11px] text-mut mt-1">
+        {sleep.kind === "time" ? `将在 ${clockOf(sleep.until)} 暂停播放` : sleep.kind === "episode" ? "本集播完后暂停，不再自动播下一集" : "到点暂停正在播放的视频"}
+      </div>
+      <div className="grid grid-cols-3 gap-2 mt-3">
+        {SLEEP_CHOICES.map(([label, value]) => {
+          const on = value === "episode" ? sleep.kind === "episode" : sleep.kind === "time" && sleep.minutes === value;
+          return (
+            <button key={label} onClick={() => pick(value)} aria-pressed={on}
+              className={`h-11 rounded-(--r-sm) text-[12.5px] font-semibold pressable ${on ? "bg-primary text-on-primary" : "bg-s3 text-on/80"}`}>
+              {label}
+            </button>
+          );
+        })}
+      </div>
+      {sleep.kind !== "off" && (
+        <button onClick={() => pick("off")} className="w-full h-11 mt-3 rounded-(--r-ctl) bg-s3 text-[13px] font-semibold text-on pressable">取消定时</button>
+      )}
     </div>
   );
 }

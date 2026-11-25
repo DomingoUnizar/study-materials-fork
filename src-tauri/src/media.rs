@@ -369,6 +369,9 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     Ok((Some(mime), arc))
 }
 
+/// 离线下载每个文件的时限：分片常有 2–6 MB，按 1 Mbps 的慢网络也要留够时间读完。
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// 离线下载用：同一地址正在下载时与播放合并请求，内存缓存里已有的 Key/分片直接复用；
 /// 下载结果不写入内存缓存，以免挤掉正在播放的内容。
 pub async fn download_bytes(url: &str) -> Result<Arc<Vec<u8>>, String> {
@@ -378,7 +381,9 @@ pub async fn download_bytes(url: &str) -> Result<Arc<Vec<u8>>, String> {
     if let Some((_, hit)) = SEG_CACHE.lock().unwrap().get(url) {
         return Ok(hit);
     }
-    fetch_shared(url).await.map(|(_, bytes)| bytes)
+    fetch_shared_with(url, || crate::net::fetch_bytes_within(url, DOWNLOAD_TIMEOUT))
+        .await
+        .map(|(_, bytes)| bytes)
 }
 
 /// 清空封面 / 播放列表 / 分片内存缓存

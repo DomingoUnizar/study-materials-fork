@@ -7,13 +7,14 @@ import { Avatar, Img, Sheet } from "./ui";
 import VideoSurface, { type VideoHandle } from "./VideoSurface";
 import PlayerControls from "./PlayerControls";
 import PlaybackLock from "./PlaybackLock";
-import { ArticlePanel, CachePanel, CommentsPanel, EpisodesPanel } from "./Panels";
+import { ArticlePanel, CachePanel, CommentsPanel, EpisodesPanel, SleepPanel } from "./Panels";
+import { onSleepTime, stopAfterEpisode, useSleepTimer } from "../sleepTimer";
 import { isOffline, isOfflineUrl, offlineSeries, offlineUrl, setStreaming, useOffline } from "../offline";
 import { disableHevc, hevcPlayed, preferHevc } from "../hevc";
 import { setBackHandler } from "../back";
 import {
   IBack, IBoltF, ICheck, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IDownload, IExpand, IFileText, IHeart, IHeartF,
-  ILink, IList, ILockF, INext, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
+  IClock, ILink, IList, ILockF, INext, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
 } from "../icons";
 import { markSeen } from "../favUpdates";
 
@@ -62,7 +63,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [err, setErr] = useState("");
   /* 取播放地址失败后手动重试：递增即重新触发拉取 */
   const [playTry, setPlayTry] = useState(0);
-  const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | "cache" | null>(null);
+  const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | "cache" | "sleep" | null>(null);
+  const sleep = useSleepTimer();
   useOffline(); // 缓存进度变化时刷新「缓存」按钮状态
   const [descOpen, setDescOpen] = useState(false);
   /* 续播：拿到时长后再 seek 一次（只对进入时那一条生效） */
@@ -432,6 +434,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setStreaming(streamId.current, active && !paused && !!playUrl && !isOfflineUrl(playUrl));
   }, [active, paused, playUrl]);
   useEffect(() => () => setStreaming(streamId.current, false), []);
+
+  /* 定时关闭到点：暂停当前页正在播的视频 */
+  useEffect(() => onSleepTime(() => {
+    if (!active) return;
+    videoRef.current?.pause();
+    toast("定时关闭：已暂停播放", "info");
+  }), [active, toast]);
 
   /* HEVC 播放出错时自动换回同一集的 H.264，从原位置接着播；解码错误说明设备其实不支持，之后不再优先 HEVC */
   const onPlayError = (message: string) => {
@@ -986,7 +995,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); if (playUrl === hevcPlays[playKey]?.hevc) hevcPlayed(); }}
                       onPause={() => setPaused(true)}
                       onWaiting={() => setWaiting(true)}
-                      onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
+                      onEnded={() => {
+                        // 定时关闭选了「播完本集」：停在这一集，不连播下一集
+                        if (stopAfterEpisode()) { videoRef.current?.pause(); toast("定时关闭：本集已播完", "info"); return; }
+                        const next = episodes.find((e) => e.ep_num === curEp + 1);
+                        if (next) pickEp(next.ep_num);
+                      }}
                       onError={onPlayError}
                     />
                   </div>
@@ -1200,7 +1214,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     <small>{listIndex + 1} / {listLength}</small>
                   </div>
                 ) : (
-                  <div className="absolute inset-x-0 z-20 flex items-center gap-2 px-2.5" style={{ top: "calc(var(--sat, 0px) + 8px)", paddingRight: 148 }}>
+                  <div className="absolute inset-x-0 z-20 flex items-center gap-2 px-2.5" style={{ top: "calc(var(--sat, 0px) + 8px)", paddingRight: 192 }}>
                     <button onClick={onBack} aria-label="返回" className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><IBack size={20} /></button>
                     <span className="text-[14.5px] font-semibold hg-ink hg-ov-shadow truncate">{title}</span>
                     <span className="ml-auto px-2 py-0.5 rounded-full hg-chip text-[11px] font-semibold" style={{ color: "rgba(255,255,255,.9)" }}>{listIndex + 1} / {listLength}</span>
@@ -1399,9 +1413,14 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
             </div>
           </Sheet>
 
-          {/* 离线缓存：本集 / 本剧剩余集 */}
+          {/* 离线缓存：按集勾选 */}
           <Sheet open={panel === "cache"} onClose={() => setPanel(null)}>
             <CachePanel detail={detail} curEp={curEp} onClose={() => setPanel(null)} />
+          </Sheet>
+
+          {/* 定时关闭（右上角时钟入口） */}
+          <Sheet open={panel === "sleep"} onClose={() => setPanel(null)}>
+            <SleepPanel onClose={() => setPanel(null)} />
           </Sheet>
 
           {/* 吃瓜图文正文 */}
@@ -1489,6 +1508,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           </button>
           <button onClick={lockControls} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false}
             className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><ILockF size={17} /></button>
+          {/* 定时关闭：开启后图标变成主题色 */}
+          <button onClick={() => setPanel("sleep")} aria-label="定时关闭" aria-pressed={sleep.kind !== "off"}
+            className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"
+            style={sleep.kind !== "off" ? { color: "var(--p-primary)" } : undefined}><IClock size={18} /></button>
           <button onClick={() => store.setTab("search")} aria-label="搜索"
             className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><ISearch size={18} /></button>
         </div>

@@ -162,6 +162,8 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
   const [items, setItems] = useState<VideoCard[]>([]);
   const [page, setPage] = useState(0);
   const [pages, setPages] = useState(1);
+  /** 上游这个频道的总部数（含被内容过滤隐藏的） */
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const busy = useRef(false);
@@ -183,6 +185,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
       });
       setPage(next);
       setPages(res?.pagination?.pages || next);
+      setTotal(res?.pagination?.total || 0);
       setErr(null);
     } catch (e) {
       if (g === gen.current) setErr((e as Error).message || "加载失败");
@@ -204,6 +207,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     setItems([]);
     setPage(0);
     setPages(1);
+    setTotal(0);
     setErr(null);
   }, [order]);
   useEffect(() => { if (page === 0) loadMore(); /* eslint-disable-next-line */ }, [page, order]);
@@ -221,6 +225,8 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     if (sort === "高分") return (b.score || 0) - (a.score || 0);
     return 0; // 「最新」保持上游按上架时间返回的顺序
   });
+  /* 标题行写上游的总部数；内容过滤藏掉的条数单独写出来，免得看起来像片库变小了 */
+  const hidden = items.length - sorted.length;
 
   return (
     <div className="absolute inset-0 bg-bg flex flex-col">
@@ -230,7 +236,9 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
           <span className="w-[40px] h-[40px] rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center"><IGrid size={21} strokeWidth={1.9} /></span>
           <div className="flex-1 min-w-0">
             <div className="text-[17px] font-bold text-on leading-tight">{name}</div>
-            <div className="text-[10.5px] text-mut">共 {sorted.length} 部 · 已加载 {page}/{Math.max(pages, 1)} 页</div>
+            <div className="text-[10.5px] text-mut">
+              共 {Math.max(total, items.length)} 部 · 已加载 {page}/{Math.max(pages, 1)} 页{hidden > 0 ? ` · 已屏蔽 ${hidden} 部` : ""}
+            </div>
           </div>
         </div>
         <div className="px-4 pb-3 flex gap-2">

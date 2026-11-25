@@ -150,8 +150,11 @@ try {
   const firstCard = await page.getByText("已加载ai-duanju", { exact: true }).boundingBox();
   const secondCard = await page.getByText("另一部", { exact: true }).boundingBox();
   assert(Math.abs(firstCard.y - secondCard.y) < 2 && secondCard.x > firstCard.x, "Cards fill the grid row by row");
-  assert.equal(await page.getByText("共 1 集", { exact: true }).count(), 4, "Every card shows its episode count above the title");
-  report.passed.push("Channel: 最新 uses upstream sort=new, 最热 the default order, 高分 sorts locally; 男同-tagged series hidden; grid fills row by row; episode count on every cover");
+  // The corner badge already says 已完结 / 更新至N集; the episode count belongs on the favourites' covers instead.
+  assert.equal(await page.getByText("共 1 集", { exact: true }).count(), 0, "Channel cards do not repeat the episode count");
+  // The header gives upstream's size for the channel and how many loaded series the tag filter hid, not just what is shown.
+  await visible(page.getByText(/共 1764 部 · 已加载 1\/1 页 · 已屏蔽 1 部/));
+  report.passed.push("Channel: 最新 uses upstream sort=new, 最热 the default order, 高分 sorts locally; 男同-tagged series hidden and counted in the header next to upstream's total; grid fills row by row; no repeated episode count");
   assert.deepEqual(errors, [], "No page errors");
   assert.deepEqual(report.external, [], "No upstream traffic");
   await page.screenshot({ path: join(output, "final.png"), fullPage: true });

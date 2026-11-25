@@ -605,6 +605,13 @@ pub async fn offline_set_paused(paused: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 网络中断后停着的下载接着下（回到应用、网络恢复、用户点了中断的集）。
+#[tauri::command]
+pub async fn offline_resume() -> Result<(), String> {
+    crate::offline::resume();
+    Ok(())
+}
+
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
 
 #[tauri::command]

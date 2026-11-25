@@ -20,7 +20,6 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
         <IPlayF size={9} />{fmt(v.hot)}
       </span>
       <div className="absolute inset-x-0 bottom-0 p-2">
-        {v.episode_count > 0 && <div className="text-[10px] font-semibold text-white/85 tsh mb-0.5">共 {v.episode_count} 集</div>}
         <div className="text-[11.5px] font-medium text-white leading-snug clamp-2 tsh">{v.title}</div>
         <div className="flex items-center justify-between mt-1">
           <span className="text-[9.5px] text-white/65 truncate max-w-[60%]">{v.author?.name || "黄果短剧"}</span>
