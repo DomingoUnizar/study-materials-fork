@@ -43,6 +43,8 @@ type Props = {
   onError?: (msg: string) => void;
   onClick?: () => void;
   className?: string;
+  /** 外层不铺黑底：视频准备好之前露出下面的封面，准备好后直接在封面上淡入（黑边由 video 元素自己的黑底提供） */
+  seeThrough?: boolean;
 };
 
 /* 安卓 WebView 静音时会关掉音频输出、取消静音时再重新打开：每次画面停一下，还有爆音。
@@ -65,7 +67,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain",
     scale = 1, panX = 0, panY = 0, isGesturing = false,
     volume = 1, rate = 1,
-    onTime, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
+    onTime, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "", seeThrough = false },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -321,7 +323,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   const hasTransform = scale !== 1 || panX !== 0 || panY !== 0;
 
   return (
-    <div className={`relative w-full h-full bg-black overflow-hidden ${className}`}>
+    <div className={`relative w-full h-full ${seeThrough ? "" : "bg-black"} overflow-hidden ${className}`}>
       {!ready && poster && (
         <img
           src={poster}

@@ -942,7 +942,14 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
               key={key}
               style={!isActive && fs ? { display: "none" } : undefined}
               className={`relative w-full h-full snap-start snap-always ${fs && isActive ? "" : "overflow-hidden"}`}>
-              {isActive && playUrl ? (
+              {/* 封面底图：每一屏一直保留同一张，播放器准备好之前、换走之后都直接露出它。
+                  原来播放器一挂上就先盖一层黑底，再贴一张裁切方式不同的海报，准备好时又露出黑底淡入；
+                  换走的那一屏还要把封面重新加载淡入，滑动换集时封面会闪两下。 */}
+              <div className="absolute inset-0">
+                <Img src={cards[vid]?.cover || posts[vid]?.cover || details[vid]?.cover || (isActive ? detail?.cover : "") || ""} eager={Math.abs(i - listIndex) <= 1} />
+                <div className="absolute inset-0" style={{ background: "rgba(0,0,0,.25)" }} />
+              </div>
+              {isActive && playUrl && (
                 <div className={rotated ? "fs-landscape" : (!isDesktop && fs ? "fs-immersive" : "absolute inset-0")}>
                   <div
                     className="absolute inset-0 overflow-hidden"
@@ -960,7 +967,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       key={surfaceGen}
                       ref={videoRef}
                       src={playUrl}
-                      poster={fs ? undefined : posterUrl}
+                      seeThrough={!fs}
                       autoPlay={!startPaused}
                       active={active}
                       diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
@@ -1107,11 +1114,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       </div>
                     </>
                   )}
-                </div>
-              ) : (
-                <div className="absolute inset-0">
-                  <Img src={cards[vid]?.cover || posts[vid]?.cover || details[vid]?.cover || (isActive ? detail?.cover : "") || ""} eager={Math.abs(i - listIndex) <= 1} />
-                  <div className="absolute inset-0" style={{ background: "rgba(0,0,0,.25)" }} />
                 </div>
               )}
 

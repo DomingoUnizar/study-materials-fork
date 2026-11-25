@@ -14,6 +14,8 @@ const signedPlayUrls = params.get("play") === "signed";
 const withEpisodes = params.get("detail") === "episodes";
 // Upstream also offers an hevc stream for every episode (same resolution, about half the bitrate).
 const hevcStreams = params.get("hevc") === "1";
+// Series detail with a real cover image (the test serves it), to check what each section shows while switching.
+const withCovers = params.get("covers") === "1";
 // Offline cache fixture: series 991, episode 1 cached, episode 2 still downloading.
 const offlineList = params.get("offline") === "1" ? {
   episodes: [
@@ -67,7 +69,7 @@ Object.assign(window, {
       fixture.feedCalls.push({ cmd, args });
       if (cmd === "api_video" && withEpisodes) {
         return Promise.resolve({
-          id: args.id, title: "测试短剧", description: "", cover: "", tags: [], score: 0, episode_count: 4, total_episodes: 4,
+          id: args.id, title: "测试短剧", description: "", cover: withCovers ? "https://cdn.fixture.invalid/cover.jpg" : "", tags: [], score: 0, episode_count: 4, total_episodes: 4,
           episodes: [1, 2, 3, 4].map(ep_num => ({ ep_num, title: `第${ep_num}集`, duration: 60, status: 1 })),
         });
       }

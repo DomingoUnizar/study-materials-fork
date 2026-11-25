@@ -15,6 +15,7 @@ const report = { device: `Android UA, ${viewport.width}x${viewport.height}, touc
 const stalled = [];
 const mediaRequests = [];
 const playlists = []; // upstream address behind every proxied playlist request
+const coverPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 let hevcFailure = "403"; // how the hevc stream fails: "403" on its playlist, or "codec" (declares a codec the device cannot decode)
 let vite, browser, page;
 try {
@@ -43,6 +44,7 @@ try {
       return route.fulfill({ status: 200, contentType: "application/vnd.apple.mpegurl", headers: { "Access-Control-Allow-Origin": "*" },
         body: "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nhttp://hg.localhost/seg?u=seg0\n#EXT-X-ENDLIST\n" });
     }
+    if (url.hostname === "hg.localhost" && url.pathname === "/img") return route.fulfill({ status: 200, contentType: "image/png", body: coverPng });
     if (url.hostname === "hg.localhost") { stalled.push(route); return undefined; }
     return route.abort();
   });
@@ -173,6 +175,35 @@ try {
   await page.mouse.up();
   await page.getByText("没有下一集啦", { exact: true }).waitFor({ state: "visible" });
   report.passed.push("Episode mode: sliding on from the last episode says there is no next episode");
+
+  // Switching episodes must not flash: every section keeps its cover underneath and, in portrait, the player has no
+  // black backdrop of its own. Before, the incoming episode went cover → black → poster → black → video and the
+  // outgoing one re-faded its cover from the placeholder.
+  await page.goto(`${origin}tests/api-loading.html?page=home&play=signed&detail=episodes&layout=mobile&covers=1`);
+  await page.waitForFunction(() => window.apiLoadingFixture.history.length === 1);
+  await page.evaluate(() => window.apiLoadingFixture.complete("api_feed", "", "item"));
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_video"));
+  for (let i = 0; i < 5 && (await sections()) !== 4; i++) {
+    await swipe(300, 100);
+    await page.waitForTimeout(400);
+  }
+  assert.equal(await sections(), 4, "Episode mode lists the 4 episodes");
+  await page.waitForFunction(() => document.querySelector("section video"));
+  const shows = () => page.evaluate(() => [...document.querySelectorAll("section")].slice(0, 2).map(sec => {
+    const v = sec.querySelector("video");
+    const base = [...sec.querySelectorAll("img")].find(img => !v || !v.parentElement.contains(img));
+    if (v && parseFloat(getComputedStyle(v).opacity) > 0.99) return "video";
+    if (v && getComputedStyle(v.parentElement).backgroundColor !== "rgba(0, 0, 0, 0)") return "black";
+    return base && base.complete && base.naturalWidth > 0 && parseFloat(getComputedStyle(base).opacity) > 0.95 ? "cover" : "placeholder";
+  }));
+  await page.waitForFunction(() => [...document.querySelectorAll("section img")].some(img => img.complete && img.naturalWidth > 0));
+  await page.waitForTimeout(400);
+  await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 2));
+  assert.deepEqual(await shows(), ["cover", "cover"], "Right after the switch both episodes show their cover");
+  await page.waitForFunction(() => document.querySelectorAll("section")[1]?.querySelector("video"));
+  assert.deepEqual(await shows(), ["cover", "cover"], "Once the next player mounts, its cover stays until the video can fade in over it");
+  report.passed.push("Switching episodes: both sections keep showing their cover (no black backdrop, no re-faded cover)");
 
   // Back from the background the video layer often stays white on Android while playback goes on; the player
   // swaps in a new video element (same address, no new play request). A blink shorter than 0.8 s keeps it.
