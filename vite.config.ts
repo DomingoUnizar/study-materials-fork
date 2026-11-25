@@ -20,7 +20,9 @@ export default defineConfig({
     strictPort: true,
     host: host || false,
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
-    watch: { ignored: ["**/src-tauri/**"] },
+    // 本地 Rust 工具链（.toolchain，上 GB）和构建/测试产物不用监听：开发服务器启动时去扫它们，
+    // 冷启动第一页能拖到两分多钟，测试一打开就超时
+    watch: { ignored: ["**/src-tauri/**", "**/.toolchain/**", "**/.tmp/**", "**/artifacts/**", "**/test-results/**"] },
   },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
   build: {

@@ -161,6 +161,7 @@ pub fn run() {
             api::offline_delete,
             api::offline_set_paused,
             api::offline_resume,
+            api::media_prefetch,
             api::api_posts,
             api::api_post,
             api::api_post_like,

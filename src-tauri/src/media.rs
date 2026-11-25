@@ -348,6 +348,9 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url) {
         return Ok((Some(ctype), hit));
     }
+    if let Some((ctype, hit)) = take_warm(url) {
+        return Ok((Some(ctype).filter(|t| !t.is_empty()), hit));
+    }
     let (ctype, bytes) = fetch_shared(url).await?;
     let mime = ctype.clone().unwrap_or_else(|| {
         let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
@@ -367,6 +370,72 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
         SEG_CACHE.lock().unwrap().put(url.to_string(), (mime.clone(), arc.clone()), len);
     }
     Ok((Some(mime), arc))
+}
+
+/* ───────────────────────── 滑动预热 ───────────────────────── */
+
+/// 预热下来的大分片（超过 SEG_CACHE 单条上限的）先放这里，播放器来要时取走一次；最多两条、90 秒过期。
+type Warm = (String, std::time::Instant, String, Arc<Vec<u8>>);
+static WARM: Lazy<Mutex<Vec<Warm>>> = Lazy::new(|| Mutex::new(Vec::new()));
+const WARM_MAX: usize = 2;
+const WARM_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
+fn put_warm(url: &str, mime: String, bytes: Arc<Vec<u8>>) {
+    let mut warm = WARM.lock().unwrap();
+    warm.retain(|(u, at, _, _)| u != url && at.elapsed() < WARM_TTL);
+    if warm.len() >= WARM_MAX {
+        warm.remove(0);
+    }
+    warm.push((url.to_string(), std::time::Instant::now(), mime, bytes));
+}
+
+fn take_warm(url: &str) -> Option<(String, Arc<Vec<u8>>)> {
+    let mut warm = WARM.lock().unwrap();
+    let i = warm.iter().position(|(u, at, _, _)| u == url && at.elapsed() < WARM_TTL)?;
+    let (_, _, mime, bytes) = warm.remove(i);
+    Some((mime, bytes))
+}
+
+/// 改写后清单里一行的本地地址（`…/seg?u=<上游地址>`）还原成上游地址
+fn local_target(line: &str) -> Option<String> {
+    let start = line.find("/seg?u=")? + "/seg?u=".len();
+    let rest = &line[start..];
+    let end = rest.find(|c: char| c == '"' || c == '&' || c.is_whitespace()).unwrap_or(rest.len());
+    Some(dec(&rest[..end])).filter(|u| !u.is_empty())
+}
+
+/// 清单里起播要用的：第一把密钥和第一个分片（多码率主清单则是第一个子清单）
+fn start_targets(rewritten: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in rewritten.lines().map(str::trim) {
+        if line.starts_with("#EXT-X-KEY:") {
+            if targets.is_empty() {
+                targets.extend(local_target(line));
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            targets.extend(local_target(line));
+            break;
+        }
+    }
+    targets
+}
+
+/// 滑动途中预热要滑到的那一条（前端 prefetchPlay 在滑过一半时调用）：清单进缓存，
+/// 密钥和第一个分片在后台取。滑停后播放器来要时，清单直接命中，密钥和分片合并到在途请求或命中缓存，
+/// 不会多下载一次；没滑过去就只多取了这一点，不会接着往下取。
+pub async fn prefetch(url: &str) -> Result<(), String> {
+    let text = load_playlist(url, LOCAL_ORIGIN).await?;
+    for target in start_targets(&text) {
+        tokio::spawn(async move {
+            if let Ok((mime, bytes)) = load_segment(&target).await {
+                // 小的已由 load_segment 放进缓存；大分片放进预热区，播放器取走一次
+                if bytes.len() > SEG_CACHE_MAX_BYTES {
+                    put_warm(&target, mime.unwrap_or_default(), bytes);
+                }
+            }
+        });
+    }
+    Ok(())
 }
 
 /// 离线下载每个文件的时限：分片常有 2–6 MB，按 1 Mbps 的慢网络也要留够时间读完。
@@ -526,6 +595,33 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_targets_are_the_first_key_and_segment_of_the_rewritten_playlist() {
+        let upstream = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k.example/crypt.key?auth_key=1\",IV=0x01\n\
+#EXTINF:6.000,\nhttps://cdn.example/v/seg0.ts?auth_key=1\n#EXTINF:6.000,\nhttps://cdn.example/v/seg1.ts?auth_key=1\n#EXT-X-ENDLIST\n";
+        let rewritten = rewrite_playlist("https://cdn.example/v/index.m3u8?auth_key=1", upstream, LOCAL_ORIGIN);
+        assert_eq!(
+            start_targets(&rewritten),
+            ["https://k.example/crypt.key?auth_key=1", "https://cdn.example/v/seg0.ts?auth_key=1"],
+            "only what the player needs to start: one key, one segment"
+        );
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2500000\nhigh/index.m3u8\n";
+        let rewritten = rewrite_playlist("https://cdn.example/v/master.m3u8", master, LOCAL_ORIGIN);
+        assert_eq!(start_targets(&rewritten), ["https://cdn.example/v/low/index.m3u8"]);
+    }
+
+    #[test]
+    fn warm_segments_are_taken_once_and_bounded() {
+        let bytes = Arc::new(vec![7u8; 8]);
+        put_warm("https://cdn.example/a.ts", "video/mp2t".into(), bytes.clone());
+        put_warm("https://cdn.example/b.ts", "video/mp2t".into(), bytes.clone());
+        put_warm("https://cdn.example/c.ts", "video/mp2t".into(), bytes.clone());
+        assert!(take_warm("https://cdn.example/a.ts").is_none(), "only the latest two are kept");
+        assert_eq!(take_warm("https://cdn.example/c.ts").map(|(m, b)| (m, b.len())), Some(("video/mp2t".to_string(), 8)));
+        assert!(take_warm("https://cdn.example/c.ts").is_none(), "taken once");
+        assert!(take_warm("https://cdn.example/b.ts").is_some());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlapping_requests_for_one_url_share_a_single_download() {

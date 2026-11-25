@@ -71,6 +71,11 @@ Object.assign(window, {
       fixture.feedCalls.push({ cmd, args });
       return Promise.resolve(cmd === "offline_list" ? offlineList : null);
     }
+    // Warming up the playlist of the video a swipe is heading to (the real one lives in the Rust proxy).
+    if (cmd === "media_prefetch") {
+      fixture.feedCalls.push({ cmd, args });
+      return Promise.resolve(null);
+    }
     if (cmd === "api_video" || cmd === "api_play") {
       fixture.feedCalls.push({ cmd, args });
       if (cmd === "api_video" && withEpisodes) {

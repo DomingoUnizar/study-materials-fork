@@ -153,15 +153,17 @@ export default function Profile({ wide }: { wide: boolean }) {
                       第 {p.ep} 集{p.t > 3 ? ` · ${fmtTime(p.t)}` : ""}
                     </div>
                   )}
-                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-1.5 pt-4">
-                    {/* 收藏：标题上方写这部剧有几集；有更新时同一处换成高亮的「更新至 N 集」，不重复写两遍 */}
-                    {tab === "fav" && (c.id in updates ? (
-                      <span className="inline-block mb-1 px-1.5 py-0.5 rounded-full bg-primary text-on-primary text-[9.5px] font-semibold leading-none">
-                        更新至 {updates[c.id]} 集
-                      </span>
-                    ) : episodeCount(c) > 0 && (
-                      <div className="mb-0.5 text-[10px] font-semibold text-white/85 tsh">共 {episodeCount(c)} 集</div>
-                    ))}
+                  {/* 收藏：左上角写集数，样式同分类页的小卡片；有更新时同一处换成高亮的「更新至 N 集」 */}
+                  {tab === "fav" && (c.id in updates ? (
+                    <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md bg-primary text-on-primary text-[9px] font-bold elev-1">
+                      更新至 {updates[c.id]} 集
+                    </span>
+                  ) : episodeCount(c) > 0 && (
+                    <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-[9px] font-bold brand-grad">
+                      {c.is_finished ? `完结 · ${episodeCount(c)}集` : `${episodeCount(c)}集`}
+                    </span>
+                  ))}
+                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-1.5">
                     <div className="text-[10.5px] text-white clamp-2 leading-tight">{c.title}</div>
                   </div>
                 </button>

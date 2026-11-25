@@ -63,7 +63,7 @@ export function CachePanel({ detail, curEp, onClose }: { detail?: Detail; curEp:
           </button>
         )}
       </div>
-      <div className="text-[11px] text-mut mt-1 leading-relaxed">点选要缓存的集。一次只下载一个文件，在线播放时自动暂停；在「我的 → 离线缓存」查看和删除。</div>
+      <div className="text-[11px] text-mut mt-1 leading-relaxed">点选要缓存的集。边看边下，一次只下载一个文件，正在看的视频缓冲不够时先让路；在「我的 → 离线缓存」查看和删除。</div>
       <div className="grid grid-cols-5 gap-2 mt-3 overflow-y-auto" style={{ maxHeight: "40vh" }}>
         {all.map((ep) => {
           const s = stateOf(ep);

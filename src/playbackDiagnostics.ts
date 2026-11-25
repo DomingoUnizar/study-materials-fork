@@ -229,8 +229,35 @@ export function observeHls(hls: Hls, trace: (event: string, data?: Data) => void
     fragment: data.frag?.sn, resource: data.frag ? mediaResource(data.frag.url) : undefined }));
 }
 
+/* 切回前台后 2 秒内页面拿到了多少动画帧：0 帧说明 WebView 没在出画面（白屏），
+   有帧但还是白，问题就在页面内容。只在开着诊断时、每次回到前台测一次。 */
+function traceFramesAfterResume() {
+  if (!playbackLogEnabled()) return;
+  const start = performance.now();
+  let frames = 0;
+  let first = -1;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    tracePlayback("page.frames", { frames, first_frame_ms: first < 0 ? null : Math.round(first), width: innerWidth, height: innerHeight });
+  };
+  const tick = (now: number) => {
+    frames += 1;
+    if (first < 0) first = now - start;
+    if (now - start < 2000) requestAnimationFrame(tick); else finish();
+  };
+  requestAnimationFrame(tick);
+  window.setTimeout(finish, 2500); // 一帧都不来时 rAF 永远不回调，靠这个落一条 0 帧的记录
+}
+
 export function installPlaybackPageEvents() {
-  document.addEventListener("visibilitychange", () => tracePlayback("page.visibility", { visibility: document.visibilityState }));
+  document.addEventListener("visibilitychange", () => {
+    tracePlayback("page.visibility", { visibility: document.visibilityState });
+    if (document.visibilityState === "visible") traceFramesAfterResume();
+  });
+  // 安卓原生层（OrientationPlugin.kt）报告的生命周期和 WebView 是否画出了画面
+  (window as unknown as { __hgNativeLifecycle?: (data: Data) => void }).__hgNativeLifecycle = (data) => tracePlayback("native.lifecycle", data);
   window.addEventListener("pagehide", () => { tracePlayback("page.hide"); void flushPlaybackLog(); });
   // 切后台后回来白屏时，看页面是否被冻结过、回到前台后脚本是否恢复运行
   document.addEventListener("freeze", () => { tracePlayback("page.freeze"); void flushPlaybackLog(); });

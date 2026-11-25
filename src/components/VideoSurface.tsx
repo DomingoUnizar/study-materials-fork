@@ -62,6 +62,15 @@ function applyAudio(v: HTMLVideoElement, muted: boolean, volume: number) {
   if (v.muted !== out.muted) v.muted = out.muted;
 }
 
+/* 画面真正画出第一帧时浏览器会回调 requestVideoFrameCallback（安卓 WebView 83+ 都有）。
+   数据进了缓冲区（FRAG_BUFFERED / loadeddata）不等于画出来了：安卓硬解首帧常要再等几百毫秒，
+   这时就把 video 显示出来，看到的是它的黑底——滑到下一集时「封面 → 黑一下 → 视频」的闪烁就是这么来的。 */
+type FrameVideo = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: () => void) => number;
+  cancelVideoFrameCallback?: (id: number) => void;
+};
+const HAS_FRAME_CALLBACK = typeof HTMLVideoElement !== "undefined" && "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+
 /** 只负责「播」：hls.js + video 元素，控制条由外层渲染。 */
 const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain",
@@ -75,7 +84,20 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   const recoverCountRef = useRef(0);
   const recoverTimerRef = useRef<number | null>(null);
   const lastSizeRef = useRef({ w: 0, h: 0 });
+  /** 显示 video（淡入）；支持首帧回调时等画出第一帧再显示 */
   const [ready, setReady] = useState(false);
+  /** 已经画出过画面：此后才给 video 铺黑底（横屏片的上下黑边），之前保持透明，透出下面的封面 */
+  const [framed, setFramed] = useState(false);
+  /** 首帧回调万一不来时的兜底（只在开播或加载完成时挂一次，不轮询） */
+  const frameFallbackRef = useRef<number | null>(null);
+  const armFrameFallback = (ms: number, markFramed: boolean) => {
+    if (!HAS_FRAME_CALLBACK || frameFallbackRef.current !== null) return;
+    frameFallbackRef.current = window.setTimeout(() => {
+      frameFallbackRef.current = null;
+      setReady(true);
+      if (markFramed) setFramed(true);
+    }, ms);
+  };
   const { trace, requestSeek } = usePlayerDiagnostics(videoRef, hlsRef, { ...diagnosticContext, active, resource: mediaResource(src) });
   const activity = usePlaybackActivity(videoRef, hlsRef, { active, autoPlay, src, trace });
 
@@ -154,6 +176,11 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     const video = videoRef.current;
     if (!video || !src) return;
     setReady(false);
+    setFramed(false);
+    if (frameFallbackRef.current !== null) { window.clearTimeout(frameFallbackRef.current); frameFallbackRef.current = null; }
+    // 画出新源的第一帧时再显示（见 HAS_FRAME_CALLBACK）
+    const frameVideo = video as FrameVideo;
+    const frameRequest = frameVideo.requestVideoFrameCallback?.(() => { setFramed(true); setReady(true); });
     recoverCountRef.current = 0;
     lastSizeRef.current = { w: 0, h: 0 };
     if (recoverTimerRef.current) {
@@ -201,7 +228,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         manifestLoadingMaxRetry: 4,
         levelLoadingTimeOut: 20000,
         levelLoadingMaxRetry: 4,
-        fragLoadingTimeOut: 25000,
+        // 与本地代理一致：分片读得慢也让它读完（代理 15 秒等不到响应头会自己重试），不到 25 秒就放弃重来
+        fragLoadingTimeOut: 60000,
         fragLoadingMaxRetry: 6,
         fragLoadingRetryDelay: 400,
         startFragPrefetch: true,
@@ -216,7 +244,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       });
       hls.on(Hls.Events.FRAG_BUFFERED, () => {
         recoverCountRef.current = 0;
-        setReady(true);
+        if (!HAS_FRAME_CALLBACK) setReady(true);
       });
       hls.on(Hls.Events.ERROR, (_e, data) => {
         // 非致命卡顿错误（常见于拖动进度条后缓冲空洞）：主动触发加载与微调跳帧
@@ -288,6 +316,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
 
     return () => {
       trace("source.cleanup");
+      if (frameRequest !== undefined) frameVideo.cancelVideoFrameCallback?.(frameRequest);
+      if (frameFallbackRef.current !== null) { window.clearTimeout(frameFallbackRef.current); frameFallbackRef.current = null; }
       if (recoverTimerRef.current) {
         window.clearTimeout(recoverTimerRef.current);
         recoverTimerRef.current = null;
@@ -339,22 +369,25 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         muted={audioOutput(muted, volume).muted}
         loop={loop}
         onClick={onClick}
-        className={`w-full h-full bg-black ${fit === "cover" ? "object-cover" : "object-contain"}`}
+        // 画出画面前不铺黑底（透出下面的封面）；不支持首帧回调的老内核照旧
+        className={`w-full h-full ${framed || !HAS_FRAME_CALLBACK ? "bg-black" : ""} ${fit === "cover" ? "object-cover" : "object-contain"}`}
         style={{
-          opacity: ready ? 1 : 0,
+          // 未显示时留 1% 而不是 0：完全透明的 video 浏览器可能不合成，首帧回调就不来了
+          opacity: ready ? 1 : HAS_FRAME_CALLBACK ? 0.01 : 0,
           transform: hasTransform ? `translate3d(${panX}px, ${panY}px, 0) scale(${scale})` : "translateZ(0)",
           transformOrigin: "center center",
           transition: isGesturing ? "opacity .25s" : "opacity .25s, transform .2s cubic-bezier(.2,0,0,1)",
         }}
         onLoadedData={(e) => {
           const v = e.target as HTMLVideoElement;
-          setReady(true);
+          // 有首帧回调时等它；暂停着加载（如回到前台重建播放器）万一一直不回调，1.5 秒后照样显示（仍不铺黑底）
+          if (HAS_FRAME_CALLBACK) armFrameFallback(1500, false); else setReady(true);
           reapply(v);
           reportSizeAndDuration(v);
         }}
         onCanPlay={(e) => {
           const v = e.target as HTMLVideoElement;
-          setReady(true);
+          if (!HAS_FRAME_CALLBACK) setReady(true);
           reportSizeAndDuration(v);
         }}
         onTimeUpdate={(e) => {
@@ -387,7 +420,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
           onWaiting?.();
         }}
         onPlaying={(e) => {
-          setReady(true);
+          // 有首帧回调时等它；已经在播却 2 秒都没回调，就当画面在出了（不让视频一直看不见）
+          if (HAS_FRAME_CALLBACK) armFrameFallback(2000, true); else setReady(true);
           recoverCountRef.current = 0;
           reportSizeAndDuration(e.target as HTMLVideoElement);
           if (activity.isActive()) onPlaying?.();

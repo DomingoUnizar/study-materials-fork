@@ -20,6 +20,8 @@ import { markSeen } from "../favUpdates";
 
 /* 竖屏进度条（连同上方的标题、详情区）离屏幕底部至少 56px，避开安卓全面屏手势区 */
 const MOBILE_BAR_BOTTOM = 56;
+/** 内核支持 scrollend 事件（Chromium 114+），用它判断滑动已经停下 */
+const HAS_SCROLLEND = typeof window !== "undefined" && "onscrollend" in window;
 
 type Props = {
   videoIds: number[];
@@ -160,6 +162,19 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     liveRef.current = { id: curId, ep: curEp, dur: duration, t };
     if (!barScrub.current) {
       setTime(t);
+    }
+    // 前方缓冲够不够 15 秒：决定离线下载要不要给播放让路（见下面 setStreaming 那段）
+    const v = videoRef.current?.el();
+    if (v) {
+      let ahead = 0;
+      for (let i = 0; i < v.buffered.length; i++) {
+        if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) > t) ahead = v.buffered.end(i) - t;
+      }
+      const low = ahead < 15;
+      if (low !== lowBuffer.current) {
+        lowBuffer.current = low;
+        setStreaming(streamId.current, active && !paused && !!playUrl && !isOfflineUrl(playUrl) && (waiting || low));
+      }
     }
     const now = Date.now();
     if (duration > 0 && now - lastSaveRef.current > 5000) {
@@ -336,21 +351,51 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inSeries]);
 
-  /* 滚动定位（全屏或缩放手势期间锁定索引，避免容器尺寸变化误触发翻页） */
-  const onScroll = useCallback(() => {
+  /* 滚动定位（全屏或缩放手势期间锁定索引，避免容器尺寸变化误触发翻页）。
+     滑停、某一屏完全对齐后才切换当前条目：滑动途中上下两屏都在画面里，过半就切换会让上一屏的视频
+     立刻换成封面、下一屏半路才开始加载，看起来就是封面闪一下。半路只先替要去的那一屏取播放地址
+     （见 prefetchPlay），滑停后直接起播。 */
+  const prefetchRef = useRef<(id: number | undefined, ep: number) => void>(() => {}); // 在下面定义 prefetchPlay 后赋值
+  /** force：滚动已经结束（scrollend），不管是否刚好对齐都按最近的一屏切换 */
+  const settleScroll = useCallback((force: boolean) => {
     if (fs || pinchRef.current) return;
     const el = boxRef.current;
     if (!el) return;
     const h = el.clientHeight || 1;
     const i = Math.max(0, Math.min(listLength - 1, Math.round(el.scrollTop / h)));
+    const target = el.children[i] as HTMLElement | undefined;
+    const settled = force || !target || Math.abs(target.getBoundingClientRect().top - el.getBoundingClientRect().top) < 2;
     if (inSeries) {
       const ep = episodes[i]?.ep_num;
+      if (!settled) { if (ep) prefetchRef.current(curId, ep); return; }
       if (ep && ep !== curEp) setEpMap((m) => ({ ...m, [curId]: ep }));
+      return;
+    }
+    if (!settled) {
+      const id = videoIds[i];
+      if (id) prefetchRef.current(id, epMap[id] || 1);
       return;
     }
     setIndex((prev) => (prev === i ? prev : i));
     if (onNearEnd && i >= videoIds.length - 3) onNearEnd();
-  }, [videoIds.length, onNearEnd, fs, inSeries, listLength, episodes, curEp, curId]);
+  }, [videoIds, onNearEnd, fs, inSeries, listLength, episodes, curEp, curId, epMap]);
+  /* 滚动结束兜底：有 scrollend 的内核（安卓 WebView 114+）用它；老内核停止滚动 200ms 后按最近的一屏切换 */
+  const settleTimer = useRef(0);
+  const onScroll = useCallback(() => {
+    settleScroll(false);
+    if (!HAS_SCROLLEND) {
+      window.clearTimeout(settleTimer.current);
+      settleTimer.current = window.setTimeout(() => settleScroll(true), 200);
+    }
+  }, [settleScroll]);
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || !HAS_SCROLLEND) return undefined;
+    const onEnd = () => settleScroll(true);
+    el.addEventListener("scrollend", onEnd);
+    return () => el.removeEventListener("scrollend", onEnd);
+  }, [settleScroll]);
+  useEffect(() => () => window.clearTimeout(settleTimer.current), []);
 
   const go = useCallback((delta: number) => {
     const el = boxRef.current;
@@ -403,10 +448,54 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, index, videoIds]);
 
-  /* 拉播放地址 */
+  /* 取播放地址：同一集在途时共用一个请求。滑动过半时会先替要滑到的那一集取（见 onScroll），
+     顺带让本地代理把清单、密钥和第一个分片也先取好，滑停后直接起播 */
+  const playUrlsRef = useRef(playUrls);
+  playUrlsRef.current = playUrls;
+  const playFetches = useRef(new Map<string, Promise<string>>());
+  const prefetchedKeys = useRef(new Set<string>());
+  const requestPlay = (id: number, ep: number): Promise<string> => {
+    const key = `${id}:${ep}`;
+    const known = playUrlsRef.current[key];
+    if (known) return Promise.resolve(known);
+    const inflight = playFetches.current.get(key);
+    if (inflight) return inflight;
+    const request = api.play(id, ep)
+      .then((info) => {
+        if (!info?.video_url) throw new Error("暂无播放地址");
+        const hevc = info.video_url_hevc && preferHevc() ? info.video_url_hevc : "";
+        const url = hevc || info.video_url;
+        setPlayUrls((m) => ({ ...m, [key]: url }));
+        if (hevc) setHevcPlays((m) => ({ ...m, [key]: { hevc, main: info.video_url } }));
+        return url;
+      })
+      .finally(() => { playFetches.current.delete(key); });
+    playFetches.current.set(key, request);
+    return request;
+  };
+  const activeKeyRef = useRef(playKey);
+  activeKeyRef.current = playKey;
+  const prefetchPlay = (id: number | undefined, ep: number) => {
+    const key = `${id}:${ep}`;
+    if (!id || kind !== "video" || key === activeKeyRef.current || isOffline(id, ep)) return;
+    if (playUrlsRef.current[key] || playFetches.current.has(key)) return;
+    requestPlay(id, ep)
+      .then((url) => {
+        // 还没滑到那一集：记下来，滑到时再记观看历史
+        if (activeKeyRef.current !== key) prefetchedKeys.current.add(key);
+        invoke("media_prefetch", { url }).catch(() => {});
+      })
+      .catch(() => { /* 滑到那一集时会重新请求并显示错误 */ });
+  };
+  prefetchRef.current = prefetchPlay;
+
   useEffect(() => {
     if (!curId) return;
-    if (playUrls[playKey]) return;
+    if (playUrls[playKey]) {
+      // 地址是滑动途中预取的：现在才真正看到这一集
+      if (prefetchedKeys.current.delete(playKey)) addHistory(curId, curEp);
+      return;
+    }
     // 已缓存的集直接读本地，不向上游请求播放地址
     if (isOffline(curId, curEp)) {
       setPlayUrls((m) => ({ ...m, [playKey]: offlineUrl(curId, curEp) }));
@@ -414,25 +503,22 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       return;
     }
     let alive = true;
-    api.play(curId, curEp)
-      .then((info) => {
-        if (!alive) return;
-        if (!info?.video_url) throw new Error("暂无播放地址");
-        const hevc = info.video_url_hevc && preferHevc() ? info.video_url_hevc : "";
-        setPlayUrls((m) => ({ ...m, [playKey]: hevc || info.video_url }));
-        if (hevc) setHevcPlays((m) => ({ ...m, [playKey]: { hevc, main: info.video_url } }));
-        addHistory(curId, curEp);
-      })
+    requestPlay(curId, curEp)
+      .then(() => { if (alive) addHistory(curId, curEp); })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curId, curEp, playTry]);
 
-  /* 在线播放时暂停离线下载，避免和播放抢带宽；播放本地缓存、暂停或离开页面时恢复 */
+  /* 离线下载给在线播放让路：只在当前视频缓冲不够（正在转圈，或前方缓冲不足 15 秒）时暂停下载，
+     缓冲够了就接着下，所以边看边缓存。播放本地缓存、暂停或离开播放页时不让路。
+     缓冲量在 timeupdate 里顺带读（见 onTimeTick），不另外轮询。 */
   const streamId = useRef(`feed-${Math.random().toString(36).slice(2)}`);
+  const lowBuffer = useRef(true);
+  const streamingOnline = active && !paused && !!playUrl && !isOfflineUrl(playUrl);
   useEffect(() => {
-    setStreaming(streamId.current, active && !paused && !!playUrl && !isOfflineUrl(playUrl));
-  }, [active, paused, playUrl]);
+    setStreaming(streamId.current, streamingOnline && (waiting || lowBuffer.current));
+  }, [streamingOnline, waiting]);
   useEffect(() => () => setStreaming(streamId.current, false), []);
 
   /* 定时关闭到点：暂停当前页正在播的视频 */
@@ -499,6 +585,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
+    lowBuffer.current = true; // 新的一集从空缓冲开始：缓冲到 15 秒前离线下载先让路
     setStartPaused(false);
     setVsize({ w: 0, h: 0 });
     setPortraitFit("contain");

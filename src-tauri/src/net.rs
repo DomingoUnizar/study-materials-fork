@@ -129,6 +129,9 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(10))
+        // 连接中途没了动静（15 秒一个字节都读不到）就当断了重试；读得慢但一直在读的大分片不受影响
+        //（总时限另由各请求自己定，见 fetch_bytes）
+        .read_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .referer(false)
         .gzip(true)
@@ -205,7 +208,20 @@ pub async fn get(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
-    tokio::time::timeout(timeout, async {
+    get_within(raw, timeout, timeout, accept, referer).await
+}
+
+/// 同 [`get`]，但分开两个时限：`header_timeout` 内要等到响应头（连不上、卡死的连接尽快换一次），
+/// `total_timeout` 是连同读完响应体的总时限（大分片在慢网络下要多给时间，免得读到一半被掐掉从头再来）。
+pub async fn get_within(
+    raw: &str,
+    header_timeout: Duration,
+    total_timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+) -> Result<reqwest::Response, String> {
+    let timeout = total_timeout;
+    tokio::time::timeout(header_timeout, async {
         let policy_error = |phase: &str, error: String| {
             crate::playback_log::record("network.target_failed", json!({"resource": crate::playback_log::resource_id(raw), "phase": phase, "error_kind": crate::playback_log::error_kind(&error)}));
             error
@@ -823,11 +839,13 @@ pub async fn edge(
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
-    fetch_bytes_within(url, Duration::from_secs(20)).await
+    // 15 秒等不到响应头就重试；读响应体最多 60 秒：一个分片 2–6 MB，慢的时候 20 秒读不完，
+    // 原来到点就掐掉、从头重下（播放器那边一直转圈），现在让它下完
+    fetch_bytes_within(url, Duration::from_secs(60)).await
 }
 
-/// 同 [`fetch_bytes`]，但每次请求（含读完响应体）的时限由调用方定：
-/// 离线下载不赶时间，一个分片常有好几 MB，慢网络下 20 秒读不完。
+/// 同 [`fetch_bytes`]，但每次请求（含读完响应体）的总时限由调用方定（离线下载不赶时间，给得更长）；
+/// 等响应头的时限固定 15 秒。
 pub async fn fetch_bytes_within(url: &str, timeout: Duration) -> Result<(Option<String>, Vec<u8>), String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -847,7 +865,7 @@ pub async fn fetch_bytes_within(url: &str, timeout: Duration) -> Result<(Option<
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get(&url, timeout, None, Some(&referer)).await?;
+                let resp = get_within(&url, Duration::from_secs(15).min(timeout), timeout, None, Some(&referer)).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
                 if !resp.status().is_success() {

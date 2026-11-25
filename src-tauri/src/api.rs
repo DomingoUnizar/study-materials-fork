@@ -612,6 +612,12 @@ pub async fn offline_resume() -> Result<(), String> {
     Ok(())
 }
 
+/// 滑动途中预热要滑到的那一条：清单、密钥和第一个分片先取好（见 media::prefetch）。
+#[tauri::command]
+pub async fn media_prefetch(url: String) -> Result<(), String> {
+    crate::media::prefetch(&url).await
+}
+
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
 
 #[tauri::command]

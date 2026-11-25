@@ -48,6 +48,16 @@ try {
     if (url.hostname === "hg.localhost") { stalled.push(route); return undefined; }
     return route.abort();
   });
+  // The stalled test media never draws a frame; keep the first-frame callbacks so a test can fire them on purpose.
+  await page.addInitScript(() => {
+    const proto = HTMLVideoElement.prototype;
+    const original = proto.requestVideoFrameCallback;
+    if (!original) return;
+    proto.requestVideoFrameCallback = function (callback) {
+      (window.__frameCallbacks ||= []).push(callback);
+      return original.call(this, callback);
+    };
+  });
   const plays = () => page.evaluate(() => window.apiLoadingFixture.feedCalls.filter(r => r.cmd === "api_play").map(r => r.args.ep));
   const sections = () => page.locator("section").count();
   const swipe = async (fromX, toX, y = 400) => {
@@ -198,12 +208,44 @@ try {
   }));
   await page.waitForFunction(() => [...document.querySelectorAll("section img")].some(img => img.complete && img.naturalWidth > 0));
   await page.waitForTimeout(400);
-  await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
+  // Mid-swipe (both episodes half on screen) nothing switches yet: the outgoing episode keeps its video, the incoming
+  // one only gets its address and playlist fetched ahead. Snapping is turned off and scrollend swallowed just to hold
+  // the position the way a finger does (a scripted scroll ends at once).
+  const playsOf = async ep => (await plays()).filter(e => e === ep).length;
+  await page.locator("section").first().evaluate(section => {
+    window.__holdSwipe = event => event.stopPropagation();
+    window.addEventListener("scrollend", window.__holdSwipe, true);
+    section.parentElement.style.scrollSnapType = "none";
+    section.parentElement.scrollTop = section.parentElement.clientHeight * 0.6;
+  });
   await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "api_play" && r.args.ep === 2));
+  await page.waitForFunction(() => window.apiLoadingFixture.feedCalls.some(r => r.cmd === "media_prefetch"));
+  await page.waitForTimeout(300);
+  assert(await page.evaluate(() => !!document.querySelectorAll("section")[0].querySelector("video") && !document.querySelectorAll("section")[1].querySelector("video")),
+    "Mid-swipe the outgoing episode keeps its video and the incoming one has no player yet");
+  await page.locator("section").first().evaluate(section => {
+    window.removeEventListener("scrollend", window.__holdSwipe, true);
+    section.parentElement.scrollTop = section.parentElement.clientHeight;
+    section.parentElement.style.scrollSnapType = "";
+  });
   assert.deepEqual(await shows(), ["cover", "cover"], "Right after the switch both episodes show their cover");
   await page.waitForFunction(() => document.querySelectorAll("section")[1]?.querySelector("video"));
   assert.deepEqual(await shows(), ["cover", "cover"], "Once the next player mounts, its cover stays until the video can fade in over it");
-  report.passed.push("Switching episodes: both sections keep showing their cover (no black backdrop, no re-faded cover)");
+  assert.equal(await playsOf(2), 1, "The settled episode plays the address fetched mid-swipe instead of asking again");
+  // Buffered data is not a drawn frame (Android's hardware decoder needs a few hundred ms more, and showing the element
+  // early flashes its black background): the video stays see-through until the browser reports the first frame.
+  const look = () => page.evaluate(() => {
+    const style = getComputedStyle(document.querySelectorAll("section")[1].querySelector("video"));
+    return { opacity: parseFloat(style.opacity), background: style.backgroundColor };
+  });
+  await page.evaluate(() => document.querySelectorAll("section")[1].querySelector("video").dispatchEvent(new Event("loadeddata")));
+  await page.waitForTimeout(300);
+  const beforeFrame = await look();
+  assert(beforeFrame.opacity < 0.05 && beforeFrame.background === "rgba(0, 0, 0, 0)", `Data alone does not show the video: ${JSON.stringify(beforeFrame)}`);
+  await page.evaluate(() => (window.__frameCallbacks || []).splice(0).forEach(cb => cb(performance.now(), {})));
+  await page.waitForFunction(() => parseFloat(getComputedStyle(document.querySelectorAll("section")[1].querySelector("video")).opacity) > 0.99);
+  assert.equal((await look()).background, "rgb(0, 0, 0)", "Once a frame is drawn the video shows, with its black backdrop for letterboxing");
+  report.passed.push("Switching episodes: nothing switches mid-swipe (the next episode is only fetched ahead), both sections keep their cover, and the video shows only once its first frame is drawn");
 
   // Back from the background the video layer often stays white on Android while playback goes on; the player
   // swaps in a new video element (same address, no new play request). A blink shorter than 0.8 s keeps it.
@@ -269,9 +311,21 @@ try {
   await page.waitForFunction(() => document.querySelectorAll("section").length === 4);
   await page.locator("section").first().evaluate(section => { section.parentElement.scrollTop = section.parentElement.clientHeight; });
   await until(async () => (await plays()).includes(2), "Uncached episode 2 requests a play address");
-  await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_set_paused" && c.args.paused === true), "Online playback pauses downloads");
+  await until(async () => (await offlineCalls()).some(c => c.cmd === "offline_set_paused" && c.args.paused === true), "Online playback pauses downloads while it starts");
+  // Downloads only give way while the video on screen is short of data: with 15 s or more buffered ahead they go on
+  // (watching and caching at once); buffering pauses them again.
+  const pausedState = async () => (await offlineCalls()).filter(c => c.cmd === "offline_set_paused").map(c => c.args.paused).at(-1);
+  await page.evaluate(() => {
+    const v = document.querySelector("section video");
+    Object.defineProperty(v, "buffered", { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 30 }) });
+    v.dispatchEvent(new Event("playing"));
+    v.dispatchEvent(new Event("timeupdate"));
+  });
+  await until(async () => (await pausedState()) === false, "With enough buffered the download goes on during playback");
+  await page.evaluate(() => document.querySelector("section video").dispatchEvent(new Event("waiting")));
+  await until(async () => (await pausedState()) === true, "Buffering pauses the download again");
   report.metrics.offline = { local_playlists: mediaRequests.filter(u => u.startsWith("/offline/")), queued: enqueued.eps };
-  report.passed.push("Offline: cached episode plays locally without a play request; the cache sheet picks episodes one by one (cached/downloading ones locked, select all) and queues 3-4; online playback pauses downloads");
+  report.passed.push("Offline: cached episode plays locally without a play request; the cache sheet picks episodes one by one (cached/downloading ones locked, select all) and queues 3-4; online playback pauses downloads only while it is short of buffer");
 
   // A download stopped by a network interruption waits in the queue; it goes on when the app comes back to the
   // foreground (or the network returns), and the cache list says why it stopped.
@@ -380,12 +434,16 @@ try {
   assert.match(await page.getByRole("button", { name: /我的收藏/ }).innerText(), /我的收藏\s*·\s*1/, "The favourites tab shows the update count");
   const firstCard = await page.locator(".grid button").first().innerText();
   assert(firstCard.includes("更新至 4 集"), "The updated favourite comes first");
-  // Every favourite's cover says how many episodes it has, above the title; an updated one says 更新至 there instead.
-  assert(!firstCard.includes("共 4 集"), "The updated favourite does not repeat its episode count");
-  assert.equal(await page.getByText("共 4 集", { exact: true }).count(), 1, "The other favourite shows its episode count");
+  // Every favourite's cover says how many episodes it has; an updated one says 更新至 N 集 in that place instead.
+  assert(!firstCard.includes("4集"), "The updated favourite does not repeat its episode count");
+  // Top-left badge like the category cards: "N集", or "完结 · N集" once the series is finished.
+  assert.equal(await page.getByText("4集", { exact: true }).count(), 1, "The other favourite shows its episode count in the corner");
+  const badge = await page.getByText("4集", { exact: true }).boundingBox();
+  const cardBox = await page.locator(".grid button").nth(1).boundingBox();
+  assert(badge.y - cardBox.y < 20 && badge.x - cardBox.x < 20, "The episode count sits in the top-left corner");
   await favUpdates("markSeen", 991, 4);
   await page.getByText("更新至 4 集", { exact: true }).waitFor({ state: "detached" });
-  assert.equal(await page.getByText("共 4 集", { exact: true }).count(), 2, "Once seen, it shows its episode count again");
+  assert.equal(await page.getByText("4集", { exact: true }).count(), 2, "Once seen, it shows its episode count again");
   await page.evaluate(() => localStorage.clear());
 
   // Opening the favourites compares the details the page loads anyway: the update shows at once, before the timed
@@ -408,7 +466,7 @@ try {
   const failedCalls = (await videoCalls()).length;
   assert(failedCalls > 0 && failedCalls <= 4, `A failing check stops after a few requests (${failedCalls})`);
   assert.equal(await page.evaluate(() => localStorage.getItem("hghub_fav_checked_at")), null, "A check that got nothing does not count");
-  report.passed.push("Favourite updates: new episodes are found per favourite, shown first with a badge and a tab count; timed checks are 6 hours apart, a check that got nothing does not count; opening the favourites shows updates at once with no extra requests; seeing the series clears it; every favourite's cover shows its episode count above the title");
+  report.passed.push("Favourite updates: new episodes are found per favourite, shown first with a badge and a tab count; timed checks are 6 hours apart, a check that got nothing does not count; opening the favourites shows updates at once with no extra requests; seeing the series clears it; every favourite's cover shows its episode count in the top-left corner");
   await page.evaluate(() => localStorage.clear());
 
   // HEVC: an Android device that reports HEVC support tries the hevc stream first (same resolution, about
