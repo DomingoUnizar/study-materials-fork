@@ -12,6 +12,7 @@ import android.content.pm.ActivityInfo
 import android.view.View
 import android.webkit.WebView
 import androidx.annotation.Keep
+import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONObject
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -40,15 +41,15 @@ class OrientationPlugin(private val activity: Activity) : Plugin(activity) {
     this.webView = webView
   }
 
-  override fun onPause() = report("pause")
+  override fun onPause(activity: AppCompatActivity) = report("pause")
 
-  override fun onStop() = report("stop")
+  override fun onStop(activity: AppCompatActivity) = report("stop")
 
-  override fun onRestart() = report("restart")
+  override fun onRestart(activity: AppCompatActivity) = report("restart")
 
   // 回到前台：postVisualStateCallback 在 WebView 真正画出当前页面时回调。1.5 秒内没回调，
   // 说明它没在出画面（就是白屏），把它隐藏再显示一次，让它重新出画面。正常时只多一次回调，没有别的动作。
-  override fun onResume() {
+  override fun onResume(activity: AppCompatActivity) {
     val wv = webView ?: return
     val round = ++resumeRound
     report("resume")
